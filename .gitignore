@@ -1,0 +1,6 @@
+dist/
+*.zip
+*.log
+log.txt
+snapshot.txt
+*.bak-*
