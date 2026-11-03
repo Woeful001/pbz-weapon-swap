@@ -78,4 +78,4 @@ if (Test-Path $modsTxt) {
 
 Write-Host ""
 Write-Host "装好了。进游戏后：" -ForegroundColor Green
-Write-Host "  <  上一把    >  下一把    F2  恢复原始装备    F11 自检    F12 打印排序"
+Write-Host "  1（原生切换键）切换武器    F9  设置菜单    F2  恢复原始装备"
