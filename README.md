@@ -11,7 +11,7 @@
 
 ## 安装
 
-前置：已安装 [UE4SS](https://github.com/UE4SS-RE/RE-UE4SS)（本模组在 UE4SS v3.0.1 Beta 上开发验证）。
+前置：UE4SS for Phantom Blade Zero https://www.nexusmods.com/phantombladezero/mods/5 或其他类似文件。
 
 1. 把 `PBZWeaponSwap` 整个文件夹放进：
 
