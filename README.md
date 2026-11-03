@@ -1,7 +1,7 @@
 # PBZ Weapon Swap
 
 《影之刃零》(Phantom Blade Zero) 的 UE4SS Lua 模组：把游戏**原生的主/副武器切换键**（键盘 `1`、手柄十字键）改成「按拼音顺序换上武器池里的下一把」。
-
+<img width="1604" height="947" alt="dea53d485d864652fb0ac3dcb8d3642b" src="https://github.com/user-attachments/assets/73e5de6a-336d-4bfd-96e0-5fba2faef7d9" />
 - 一次按键 = 一次切换：原生换武器动作（含配套的换武器技能）完整播放，不是「先切一把再补一刀」
 - 四种模式：关闭 / 循环 / 随机 / 自定义，`F9` 打开设置菜单，自定义池里 25 把武器逐项勾选
 - 排序取游戏数据表里的中文武器名，按完整拼音升序（首字母分组，组内按全拼），可循环
