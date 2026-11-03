@@ -1,6 +1,8 @@
--- PBZWeaponSwap v2
--- 用游戏原生的主/副武器切换键驱动换武器：关闭 / 循环 / 随机 / 自定义池，F9 打开设置菜单。
--- 不改按键绑定，只在游戏调用 SetCurrentWeaponByIndex 时接管一次，然后走本模组的切换逻辑。
+-- PBZWeaponSwap v3
+-- 用游戏原生的换武器键驱动两套武器：
+--   主武器   键盘 1 / 手柄十字键左   -> SetCurrentWeaponByIndex(idx, true)
+--   影之武装 键盘 2 / 手柄十字键右   -> SetCurrentWeaponByIndex(idx, false)
+-- 每套各自有 关闭 / 循环 / 随机 / 自定义池 四种模式，F9 打开菜单，首行选择要配置哪一套。
 
 local SRC = debug.getinfo(1, 'S').source:gsub('^@', '')
 local DIR = SRC:match('^(.*[/\\])') or ''
@@ -20,7 +22,7 @@ local function log(fmt, ...)
     end
 end
 
--- ── 汉字 -> 拼音（覆盖 25 把武器名用到的字）────────────────────────
+-- ── 汉字 -> 拼音（覆盖武器名用到的字）──────────────────────────────
 local PY = {
     ["黑"] = "hei", ["伤"] = "shang", ["木"] = "mu", ["制"] = "zhi", ["双"] = "shuang",
     ["刃"] = "ren", ["残"] = "can", ["钢"] = "gang", ["长"] = "chang", ["形"] = "xing",
@@ -35,7 +37,22 @@ local PY = {
     ["环"] = "huan", ["影"] = "ying", ["刺"] = "ci", ["骨"] = "gu", ["混"] = "hun",
     ["沌"] = "dun", ["偃"] = "yan", ["月"] = "yue", ["断"] = "duan", ["肢"] = "zhi",
     ["圣"] = "sheng", ["母"] = "mu", ["邪"] = "xie", ["扇"] = "shan", ["紫"] = "zi",
-    ["冥"] = "ming",
+    ["冥"] = "ming", ["勾"] = "gou", ["爪"] = "zhua", ["锤"] = "chui", ["枪"] = "qiang",
+    ["炮"] = "pao", ["弩"] = "nu", ["弓"] = "gong", ["镖"] = "biao", ["轮"] = "lun",
+    -- 影之武装用到的字
+    ["柄"] = "bing", ["金"] = "jin", ["瓜"] = "gua", ["客"] = "ke", ["召"] = "zhao",
+    ["集"] = "ji", ["令"] = "ling", ["霆"] = "ting", ["催"] = "cui", ["心"] = "xin",
+    ["琵"] = "pi", ["琶"] = "pa", ["墨"] = "mo", ["血"] = "xue", ["无"] = "wu",
+    ["痕"] = "hen", ["妙"] = "miao", ["手"] = "shou", ["飞"] = "fei", ["巨"] = "ju",
+    ["斧"] = "fu", ["拙"] = "zhuo", ["壁"] = "bi", ["盾"] = "dun", ["操"] = "cao",
+    ["偶"] = "ou", ["铃"] = "ling", ["铛"] = "dang", ["泥"] = "ni", ["头"] = "tou",
+    ["车"] = "che", ["游"] = "you", ["龙"] = "long", ["叉"] = "cha", ["火"] = "huo",
+    ["流"] = "liu", ["星"] = "xing", ["烈"] = "lie", ["焰"] = "yan", ["狮"] = "shi",
+    ["独"] = "du", ["眼"] = "yan", ["羽"] = "yu", ["苦"] = "ku", ["叶"] = "ye",
+    ["寺"] = "si", ["珠"] = "zhu", ["串"] = "chuan", ["虎"] = "hu", ["虚"] = "xu",
+    ["空"] = "kong", ["华"] = "hua", ["滴"] = "di", ["子"] = "zi", ["贪"] = "tan",
+    ["狼"] = "lang", ["追"] = "zhui", ["锁"] = "suo", ["镰"] = "lian", ["铁"] = "tie",
+    ["拳"] = "quan", ["套"] = "tao", ["黄"] = "huang", ["铳"] = "chong", ["柄"] = "bing",
 }
 
 local function pinyin(name)
@@ -60,79 +77,150 @@ local function getSub()
     return nil
 end
 
--- ── 配置 ───────────────────────────────────────────────────────────
-local Cfg = { mode = "cycle", customRandom = false, pool = nil }  -- pool: { [id]=true }
-local poolSet = {}
+-- ── 两套武器的访问器 ──────────────────────────────────────────────
+local T = {
+    main = {
+        key = "main",
+        label = "主武器",
+        hotkey = "键盘 1 / 手柄十字键左",
+        isNormal = true,
+        arr = function(sub) return sub.MainWeapons end,
+        curIdx = function(sub) return sub.CurrentWeaponIndex end,
+        curId = function(sub) return sub.CurrentMainWeaponID end,
+        replace = function(sub, id, slot) sub:ReplaceWeaponByIndex(FName(id), slot) end,
+        setCur = function(sub, idx) sub:SetCurrentWeaponByIndex(idx, true) end,
+        tbl = function(sub, fn) return sub:GetMainWeaponTableData(fn) end,
+        all = function(sub) return sub:GetAllNormalWeapons() end,
+    },
+    shaqi = {
+        key = "shaqi",
+        label = "影之武装",
+        hotkey = "键盘 2 / 手柄十字键右",
+        isNormal = false,
+        arr = function(sub) return sub.ShaqiWeapons end,
+        curIdx = function(sub) return sub.CurrentShaqiWeaponIndex end,
+        curId = function(sub) return nil end,
+        replace = function(sub, id, slot) sub:ReplaceShaqiWeaponByIndex(FName(id), slot) end,
+        setCur = function(sub, idx) sub:SetCurrentWeaponByIndex(idx, false) end,
+        tbl = function(sub, fn) return sub:GetShaqiWeaponTableData(fn) end,
+        all = function(sub) return sub:GetAllShaqiWeapons() end,
+    },
+}
+local KINDS = { "main", "shaqi" }
 
-local function poolIsAll()
-    return Cfg.pool == nil
+-- ── 配置 ─────────────────────────────────────────────────────────
+-- Cfg[kind] = { mode = "off"|"cycle"|"random"|"custom", customRandom = bool, pool = { [id]=true } | nil }
+local Cfg = {
+    target = "main", -- F9 菜单首行选择：正在配置哪一套
+    main = { mode = "cycle", customRandom = false, pool = nil },
+    shaqi = { mode = "cycle", customRandom = false, pool = nil },
+}
+
+local function poolIsAll(kind)
+    return Cfg[kind].pool == nil
+end
+
+local function normMode(v)
+    if v == "off" or v == "cycle" or v == "random" or v == "custom" then return v end
+    return nil
 end
 
 local function loadCfg()
     local f = io.open(CFG_PATH, "r")
     if not f then return end
-    local poolLine = nil
+    local lines = {}
     for line in f:lines() do
         line = line:gsub("\r", "")
-        local k, v = line:match("^(%w+)%s*=%s*(.-)%s*$")
-        if k == "mode" then
-            if v == "off" or v == "cycle" or v == "random" or v == "custom" then Cfg.mode = v end
-        elseif k == "random" then
-            Cfg.customRandom = (v == "1" or v == "true")
-        elseif k == "pool" then
-            poolLine = v
-        end
+        local k, v = line:match("^([%w_%.]+)%s*=%s*(.-)%s*$")
+        if k then lines[#lines + 1] = { k = k, v = v } end
     end
     f:close()
-    if poolLine and poolLine ~= "" then
-        Cfg.pool = {}
-        for id in poolLine:gmatch("[^,]+") do Cfg.pool[id] = true end
+    for _, kv in ipairs(lines) do
+        local k, v = kv.k, kv.v
+        if k == "target" then
+            if v == "main" or v == "shaqi" then Cfg.target = v end
+        elseif k == "mode" or k == "random" or k == "pool" then
+            -- v2 旧格式：只有一套主武器
+            if k == "mode" then
+                local m = normMode(v); if m then Cfg.main.mode = m end
+            elseif k == "random" then
+                Cfg.main.customRandom = (v == "1" or v == "true")
+            else
+                local pool = {}
+                for id in v:gmatch("[^,]+") do pool[id] = true end
+                if next(pool) then Cfg.main.pool = pool end
+            end
+        else
+            local kind, field = k:match("^(%a+)%.(%a+)$")
+            if kind and Cfg[kind] then
+                if field == "mode" then
+                    local m = normMode(v); if m then Cfg[kind].mode = m end
+                elseif field == "random" then
+                    Cfg[kind].customRandom = (v == "1" or v == "true")
+                elseif field == "pool" then
+                    local pool = {}
+                    for id in v:gmatch("[^,]+") do pool[id] = true end
+                    Cfg[kind].pool = (next(pool) ~= nil) and pool or nil
+                end
+            end
+        end
     end
-    poolSet = Cfg.pool or {}
 end
 
 local function saveCfg()
     local f = io.open(CFG_PATH, "w")
     if not f then return end
-    f:write("mode=", Cfg.mode, "\n")
-    f:write("random=", Cfg.customRandom and "1" or "0", "\n")
-    if Cfg.pool then
-        local ids = {}
-        for id in pairs(Cfg.pool) do ids[#ids + 1] = id end
-        table.sort(ids)
-        f:write("pool=", table.concat(ids, ","), "\n")
+    f:write("target=", Cfg.target, "\n")
+    for _, kind in ipairs(KINDS) do
+        local c = Cfg[kind]
+        f:write(kind, ".mode=", c.mode, "\n")
+        f:write(kind, ".random=", c.customRandom and "1" or "0", "\n")
+        if c.pool then
+            local ids = {}
+            for id in pairs(c.pool) do ids[#ids + 1] = id end
+            table.sort(ids)
+            f:write(kind, ".pool=", table.concat(ids, ","), "\n")
+        end
     end
     f:close()
 end
 
--- ── 武器数据 ───────────────────────────────────────────────────────
-local function equippedSlots(sub)
+-- ── 武器数据 ─────────────────────────────────────────────────────
+local function equippedSlots(sub, kind)
+    local def = T[kind]
     local slots, order = {}, {}
     local n = 0
-    local ok, cnt = pcall(function() return #sub.MainWeapons end)
-    if ok and type(cnt) == "number" then n = cnt end
-    for i = 1, n do
-        local id = S(sub.MainWeapons[i])
-        slots[id] = i - 1
-        order[i] = id
+    local okA, arr = pcall(def.arr, sub)
+    if okA and arr then
+        local ok, cnt = pcall(function() return #arr end)
+        if ok and type(cnt) == "number" then n = cnt end
+        for i = 1, n do
+            local id = S(arr[i])
+            slots[id] = i - 1
+            order[i] = id
+        end
     end
     return slots, order, n
 end
 
 -- 以装备栏数组为准取当前武器：CurrentMainWeaponID 在切换后常有延迟，不能用于判断
-local function curIdOf(sub)
-    local _, order, cnt = equippedSlots(sub)
-    local idx = sub.CurrentWeaponIndex
-    if type(idx) == "number" and idx >= 0 and idx < cnt and order[idx + 1] then
+local function curOf(sub, kind)
+    local def = T[kind]
+    local _, order, cnt = equippedSlots(sub, kind)
+    local okI, idx = pcall(def.curIdx, sub)
+    if okI and type(idx) == "number" and idx >= 0 and idx < cnt and order[idx + 1] then
         return order[idx + 1], idx
     end
-    return S(sub.CurrentMainWeaponID), idx
+    local okD, id = pcall(def.curId, sub)
+    return okD and S(id) or nil, idx
 end
 
-local sortedCache = nil
-local function sortedWeapons(sub)
-    if sortedCache then return sortedCache end
-    local ok, arr = pcall(function() return sub:GetAllNormalWeapons() end)
+local cache = { main = nil, shaqi = nil }
+
+local function sortedWeapons(sub, kind)
+    if cache[kind] then return cache[kind] end
+    local def = T[kind]
+    local ok, arr = pcall(def.all, sub)
     if not ok or arr == nil then return nil end
     local items = {}
     local n = #arr
@@ -143,7 +231,7 @@ local function sortedWeapons(sub)
             local fn = okG and raw or p
             local id = S(fn)
             local disp = id
-            local okT, t = pcall(function() return sub:GetMainWeaponTableData(fn) end)
+            local okT, t = pcall(def.tbl, sub, fn)
             if okT and t ~= nil then
                 local okW, wn = pcall(function() return t.WeaponName end)
                 if okW and wn ~= nil then
@@ -163,8 +251,8 @@ local function sortedWeapons(sub)
     end)
     local ids = {}
     for i, it in ipairs(items) do ids[i] = it.id end
-    sortedCache = { ids = ids, items = items }
-    return sortedCache
+    cache[kind] = { ids = ids, items = items }
+    return cache[kind]
 end
 
 local function indexOf(list, id)
@@ -193,55 +281,60 @@ local function refreshUi()
     if funcRefresh then pcall(funcRefresh) end
 end
 
-local function applyTarget(sub, target, sw)
-    local slots, _, cnt = equippedSlots(sub)
+local function applyTarget(sub, kind, target, sw)
+    local def = T[kind]
+    local slots, _, cnt = equippedSlots(sub, kind)
     local name = displayOf(sw, target)
-    local curBefore, idxBefore = curIdOf(sub)
+    local curBefore, idxBefore = curOf(sub, kind)
     busy = true
     local ok, err = pcall(function()
         clearCooldown()
         if slots[target] ~= nil then
             local idx = slots[target]
             if idx == idxBefore then
-                log("already current: %s (%s) slot=%d", target, name, idx)
+                log("[%s] already current: %s (%s) slot=%d", kind, target, name, idx)
                 return
             end
-            sub:SetCurrentWeaponByIndex(idx, true)
-            log("switch %s -> %s (%s) slot=%d", tostring(curBefore), target, name, idx)
+            def.setCur(sub, idx)
+            log("[%s] switch %s -> %s (%s) slot=%d", kind, tostring(curBefore), target, name, idx)
         else
-            if cnt == 0 then log("no equipped slot, abort (%s)", target); return end
+            if cnt == 0 then log("[%s] no equipped slot, abort (%s)", kind, target); return end
             local other = 0
             if cnt > 1 then other = (idxBefore == 0) and 1 or 0 end
-            sub:ReplaceWeaponByIndex(FName(target), other)
-            sub:SetCurrentWeaponByIndex(other, true)
-            log("equip %s (%s) into slot %d (was %s)", target, name, other, tostring(curBefore))
+            def.replace(sub, target, other)
+            def.setCur(sub, other)
+            log("[%s] equip %s (%s) into slot %d (was %s)", kind, target, name, other, tostring(curBefore))
         end
     end)
     busy = false
-    if not ok then log("ERR apply: %s", tostring(err)) end
-    local afterId, afterIdx = curIdOf(sub)
-    local _, order = equippedSlots(sub)
-    log("state: cur=%s idx=%s slots=[%s]", tostring(afterId), tostring(afterIdx), table.concat(order, ","))
+    if not ok then log("ERR apply[%s]: %s", kind, tostring(err)) end
+    local afterId, afterIdx = curOf(sub, kind)
+    local _, order = equippedSlots(sub, kind)
+    log("[%s] state: cur=%s idx=%s slots=[%s]", kind, tostring(afterId), tostring(afterIdx), table.concat(order, ","))
 end
 
-local function poolFor(sub, sw)
-    if Cfg.mode ~= "custom" or poolIsAll() then return sw.ids end
+local function poolFor(kind, sw)
+    local c = Cfg[kind]
+    if c.mode ~= "custom" or poolIsAll(kind) then return sw.ids end
     local out = {}
-    for _, id in ipairs(sw.ids) do if poolSet[id] then out[#out + 1] = id end end
+    for _, id in ipairs(sw.ids) do if c.pool[id] then out[#out + 1] = id end end
     if #out == 0 then
-        log("自定义池为空，回退到全部武器")
+        log("[%s] 自定义池为空，回退到全部武器", kind)
         return sw.ids
     end
     return out
 end
 
--- 原生切换会同时改掉 CurrentWeaponIndex，所以循环位置用本模组自己的游标，不依赖游戏当前值
-local cursorId = nil
+-- 原生切换会同时改掉当前索引，所以循环位置用本模组自己的游标，不依赖游戏当前值
+local cursors = { main = nil, shaqi = nil }
+-- 已经预置到待切槽、但玩家还没按键的武器：避免随机模式下每个 tick 都换一把塞进去
+local pending = { main = nil, shaqi = nil }
 
-local function pickNext(sub, sw, fromId)
-    local pool = poolFor(sub, sw)
+local function pickNext(kind, sw, fromId)
+    local c = Cfg[kind]
+    local pool = poolFor(kind, sw)
     if #pool == 0 then return nil, pool end
-    if Cfg.mode == "random" or (Cfg.mode == "custom" and Cfg.customRandom) then
+    if c.mode == "random" or (c.mode == "custom" and c.customRandom) then
         if #pool == 1 then return pool[1], pool end
         local cands = {}
         for _, id in ipairs(pool) do if id ~= fromId then cands[#cands + 1] = id end end
@@ -252,54 +345,85 @@ local function pickNext(sub, sw, fromId)
     return pool[(pos % #pool) + 1], pool
 end
 
-local function step()
+local function step(kind)
+    kind = kind or Cfg.target
     local sub = getSub()
     if not sub then return end
-    local sw = sortedWeapons(sub)
-    if not sw or #sw.ids == 0 then log("no weapons"); return end
-    if cursorId == nil then cursorId = curIdOf(sub) end
-    local nextId, pool = pickNext(sub, sw, cursorId)
+    local sw = sortedWeapons(sub, kind)
+    if not sw or #sw.ids == 0 then log("[%s] no weapons", kind); return end
+    if cursors[kind] == nil then cursors[kind] = curOf(sub, kind) end
+    local nextId, pool = pickNext(kind, sw, cursors[kind])
     if not nextId then return end
-    local actual = curIdOf(sub)
+    local actual = curOf(sub, kind)
     if nextId == actual and pool and #pool > 1 then
-        local again = pickNext(sub, sw, nextId)
+        local again = pickNext(kind, sw, nextId)
         if again then nextId = again end
     end
-    cursorId = nextId
-    applyTarget(sub, nextId, sw)
+    cursors[kind] = nextId
+    applyTarget(sub, kind, nextId, sw)
     refreshUi()
 end
--- ── 原始装备快照 ───────────────────────────────────────────────────
-local function saveSnapshot(order, idx)
+
+-- ── 原始装备快照（主武器 + 影之武装）──────────────────────────────
+local function saveSnapshot()
+    local sub = getSub()
+    if not sub then return end
     local f = io.open(SNAP_PATH, "w")
     if not f then return end
-    f:write(tostring(idx), "\n")
-    for i = 1, #order do f:write(order[i], "\n") end
+    f:write("v2\n")
+    for _, kind in ipairs(KINDS) do
+        local slots, order, cnt = equippedSlots(sub, kind)
+        if cnt > 0 then
+            local _, idx = curOf(sub, kind)
+            f:write(kind, " ", tostring(idx or 0), " ", tostring(cnt), "\n")
+            for i = 1, cnt do f:write(order[i], "\n") end
+        end
+    end
     f:close()
+    for _, kind in ipairs(KINDS) do
+        local slots, order = equippedSlots(sub, kind)
+        log("snapshot[%s] slots=[%s]", kind, table.concat(order, ","))
+    end
 end
 
 local function loadSnapshot()
     local f = io.open(SNAP_PATH, "r")
     if not f then return nil end
-    local idx = tonumber(f:read("l") or "")
-    local list = {}
+    local lines = {}
     for line in f:lines() do
-        line = line:gsub("%s+$", "")
-        if line ~= "" then list[#list + 1] = line end
+        line = line:gsub("\r", ""):gsub("%s+$", "")
+        if line ~= "" then lines[#lines + 1] = line end
     end
     f:close()
-    if not idx or #list == 0 then return nil end
-    return idx, list
+    if #lines == 0 then return nil end
+    if lines[1] == "v2" then
+        local out = {}
+        local i = 2
+        while i <= #lines do
+            local kind, idx, cnt = lines[i]:match("^(%a+)%s+(%-?%d+)%s+(%d+)$")
+            if not kind or not T[kind] then break end
+            idx = tonumber(idx) or 0
+            cnt = tonumber(cnt) or 0
+            local list = {}
+            for j = 1, cnt do list[j] = lines[i + j] end
+            out[kind] = { idx = idx, list = list }
+            i = i + cnt + 1
+        end
+        if not next(out) then return nil end
+        return out
+    end
+    -- v2 旧格式：第一行索引，其余为主武器 ID
+    local idx = tonumber(lines[1])
+    if not idx then return nil end
+    local list = {}
+    for i = 2, #lines do list[#list + 1] = lines[i] end
+    if #list == 0 then return nil end
+    return { main = { idx = idx, list = list } }
 end
 
 local function ensureSnapshot()
-    local idx = loadSnapshot()
-    if idx then return end
-    local sub = getSub()
-    if not sub then return end
-    local _, order = equippedSlots(sub)
-    saveSnapshot(order, sub.CurrentWeaponIndex)
-    log("snapshot saved: idx=%d [%s]", sub.CurrentWeaponIndex, table.concat(order, ","))
+    if loadSnapshot() then return end
+    saveSnapshot()
 end
 
 local function restoreOriginal()
@@ -308,19 +432,25 @@ local function restoreOriginal()
         log("restore: no subsystem")
         return
     end
-    local idx, list = loadSnapshot()
-    if not idx then log("no snapshot"); return end
+    local snap = loadSnapshot()
+    if not snap then log("no snapshot"); return end
     busy = true
     local ok, err = pcall(function()
-        for i = 1, #list do
-            sub:ReplaceWeaponByIndex(FName(list[i]), i - 1)
+        for _, kind in ipairs(KINDS) do
+            local s = snap[kind]
+            if s and #s.list > 0 then
+                for i = 1, #s.list do
+                    T[kind].replace(sub, s.list[i], i - 1)
+                end
+                T[kind].setCur(sub, s.idx)
+                log("restored %s: idx=%d [%s]", kind, s.idx, table.concat(s.list, ","))
+            end
         end
-        sub:SetCurrentWeaponByIndex(idx, true)
     end)
     busy = false
     if ok then
-        log("restored original loadout (idx=%d)", idx)
-        cursorId = nil
+        cursors.main = nil
+        cursors.shaqi = nil
         refreshUi()
     else
         log("ERR restore: %s", tostring(err))
@@ -328,72 +458,79 @@ local function restoreOriginal()
 end
 
 -- ── 拦截游戏原生切换：SetCurrentWeaponByIndex(index, isNormal)──────
-local stats = { hits = 0 }
+local stats = { hits = 0, hits_shaqi = 0 }
 local idleTicks = 0 -- 距上次原生切换经过的 tick 数（空闲时才预置待切武器）
 
+local function readParam(p, default)
+    if p == nil then return default end
+    local okG, v = pcall(function() return p:get() end)
+    if okG then return v end
+    return p
+end
+
 local function onSetWeaponByIndex(ctx, idxParam, isNormalParam)
-    local take = false
     local ok, err = pcall(function()
         if busy then return end
-        if Cfg.mode == "off" then return end
-        local idx = nil
-        if idxParam ~= nil then
-            local okG, v = pcall(function() return idxParam:get() end)
-            idx = okG and v or idxParam
-        end
-        local isNormal = true
-        if isNormalParam ~= nil then
-            local okG, v = pcall(function() return isNormalParam:get() end)
-            if okG then isNormal = v and true or false end
-        end
+        local idx = readParam(idxParam, nil)
         if idx == nil or type(idx) ~= "number" then return end
-        if not isNormal then return end
+        local isNormal = readParam(isNormalParam, true)
+        local kind = (isNormal == false) and "shaqi" or "main"
+        local c = Cfg[kind]
+        if c.mode == "off" then return end
         if idx < 0 or idx > 7 then return end
         local sub = getSub()
         if not sub then return end
-        local cur = sub.CurrentWeaponIndex
+        local cur = select(2, curOf(sub, kind))
         if type(cur) ~= "number" then return end
         -- 只在“切到相邻槽位”这种原生切换调用上接管
         if math.abs(idx - cur) ~= 1 then return end
-        take = true
         stats.hits = stats.hits + 1
+        if kind == "shaqi" then stats.hits_shaqi = stats.hits_shaqi + 1 end
         idleTicks = 0
-        log("intercept native switch: idx=%s cur=%s (hit %d)", tostring(idx), tostring(cur), stats.hits)
+        log("intercept[%s] native switch: idx=%s cur=%s (hit %d, shaqi %d)",
+            kind, tostring(idx), tostring(cur), stats.hits, stats.hits_shaqi)
         -- 原生切换无法取消：目标武器若已在待切槽就直接让原生用它（技能完整播放）；
         -- 否则才在切换瞬间补写一次（仅在未预置的边缘情况发生）。
         local ok2, e2 = pcall(function()
-            local sw = sortedWeapons(sub)
+            local sw = sortedWeapons(sub, kind)
             if not sw then return end
-            if cursorId == nil then cursorId = curIdOf(sub) end
-            local target = pickNext(sub, sw, cursorId)
-            if target == nil then return end
-            if target == curIdOf(sub) then
-                local again = pickNext(sub, sw, target)
-                if again then target = again end
+            local slots = equippedSlots(sub, kind)
+            local curId = curOf(sub, kind)
+            if cursors[kind] == nil then cursors[kind] = curId end
+            -- 优先用已经预置到待切槽的那把：随机模式下“这一把”就是玩家该拿到的结果
+            local target = pending[kind]
+            if target ~= nil and (target == curId or slots[target] == nil) then target = nil end
+            if target == nil then
+                target = pickNext(kind, sw, cursors[kind])
+                if target ~= nil and target == curId then
+                    local again = pickNext(kind, sw, target)
+                    if again then target = again end
+                end
             end
-            local slots = equippedSlots(sub)
+            if target == nil then return end
             if slots[target] == nil then
                 busy = true
                 clearCooldown()
-                sub:ReplaceWeaponByIndex(FName(target), idx)
+                T[kind].replace(sub, target, idx)
                 busy = false
-                log("late preload %s into slot %d (not pre-staged)", target, idx)
+                log("late preload[%s] %s into slot %d (not pre-staged)", kind, target, idx)
             else
-                log("native switch uses pre-staged %s (slot %d)", target, idx)
+                log("native switch[%s] uses pre-staged %s (slot %d)", kind, target, idx)
             end
-            cursorId = target
+            pending[kind] = nil
+            cursors[kind] = target
             ExecuteInGameThreadWithDelay(200, function()
                 local s2 = getSub()
                 if s2 then
-                    local id2, i2 = curIdOf(s2)
-                    log("after native: cur=%s idx=%s", tostring(id2), tostring(i2))
+                    local id2, i2 = curOf(s2, kind)
+                    log("after native[%s]: cur=%s idx=%s", kind, tostring(id2), tostring(i2))
                 end
                 refreshUi()
             end)
         end)
         if not ok2 then
             busy = false
-            log("ERR hook-body: %s", tostring(e2))
+            log("ERR hook-body[%s]: %s", kind, tostring(e2))
         end
     end)
     if not ok then log("ERR hook: %s", tostring(err)) end
@@ -415,8 +552,8 @@ end
 
 local MODE_LABEL = {
     off = "关闭（保留游戏原生行为）",
-    cycle = "循环（全部已拥有武器，拼音顺序）",
-    random = "随机（全部已拥有武器）",
+    cycle = "循环（按拼音顺序轮换）",
+    random = "随机（每次换到另一把）",
     custom = "自定义（仅使用勾选的武器）",
 }
 
@@ -427,12 +564,92 @@ local modeOptions = {
     { label = MODE_LABEL.custom, value = "custom" },
 }
 
+local targetOptions = {
+    { label = "主武器（键盘 1 / 十字键左）", value = "main" },
+    { label = "影之武装（键盘 2 / 十字键右）", value = "shaqi" },
+}
+
 local menuBuilt = false
+
+local function poolItemsFor(sub, kind)
+    local sw = sortedWeapons(sub, kind)
+    local items = {}
+    if not sw then return items end
+    local c = Cfg[kind]
+    for _, it in ipairs(sw.items) do
+        local checked = (c.pool == nil) and true or (c.pool[it.id] == true)
+        items[#items + 1] = {
+            type = 'checkbox',
+            id = kind .. '_' .. it.id,
+            label = it.name .. '  ' .. it.id,
+            default = checked,
+            onChange = function(on)
+                local cc = Cfg[kind]
+                if cc.pool == nil then
+                    cc.pool = {}
+                    for _, x in ipairs(sw.items) do cc.pool[x.id] = true end
+                end
+                cc.pool[it.id] = on and true or nil
+                saveCfg()
+                refreshUi()
+            end,
+        }
+    end
+    return items
+end
+
+local function swapItems()
+    local c = Cfg[Cfg.target]
+    return {
+        { type = 'label', id = 'cur', label = '当前：—' },
+        { type = 'separator' },
+        { type = 'dropdown', id = 'target', label = '配置对象', options = targetOptions, default = Cfg.target,
+          onChange = function(v)
+              if v ~= "main" and v ~= "shaqi" then return end
+              Cfg.target = v
+              saveCfg()
+              if ui then
+                  local cc = Cfg[v]
+                  pcall(function() ui.Set('swap', 'mode', cc.mode) end)
+                  pcall(function() ui.Set('swap', 'custrand', cc.customRandom) end)
+                  pcall(function()
+                      ui.Register({ id = 'pool', title = '自定义池 · ' .. T[v].label,
+                          items = poolItemsFor(getSub(), v) })
+                  end)
+              end
+              log("menu target = %s", v)
+              refreshUi()
+          end },
+        { type = 'dropdown', id = 'mode', label = '切换模式', options = modeOptions, default = c.mode,
+          onChange = function(v)
+              local kind = Cfg.target
+              local m = normMode(v)
+              if not m then return end
+              Cfg[kind].mode = m
+              saveCfg()
+              log("[%s] mode = %s", kind, m)
+              refreshUi()
+          end },
+        { type = 'checkbox', id = 'custrand', label = '自定义池内随机顺序', default = c.customRandom,
+          onChange = function(on)
+              local kind = Cfg.target
+              Cfg[kind].customRandom = on and true or false
+              saveCfg()
+              log("[%s] customRandom = %s", kind, tostring(on))
+              refreshUi()
+          end },
+        { type = 'separator' },
+        { type = 'button', id = 'restore', label = '恢复原始装备（F2）', onClick = function()
+            pcall(restoreOriginal)
+        end },
+        { type = 'label', label = '首行选择要配置的武器类型，下面四种模式对该类型生效。\n主武器 = 键盘 1 / 手柄十字键左；影之武装 = 键盘 2 / 手柄十字键右。\n关闭 = 完全不干预，恢复原版手感。\n循环 = 按拼音顺序轮换全部武器。\n随机 = 每次随机换到另一把。\n自定义 = 只在勾选的武器里轮换。' },
+    }
+end
 
 local function buildMenu(sub)
     if not ui or menuBuilt then return end
-    local sw = sortedWeapons(sub)
-    if not sw or #sw.items == 0 then return end
+    local swMain = sortedWeapons(sub, "main")
+    if not swMain or #swMain.items == 0 then return end
 
     ui.Init({
         title = '武器切换 Weapon Swap',
@@ -447,69 +664,46 @@ local function buildMenu(sub)
         bottomFrac = 0.12,
     })
 
-    local items = {
-        { type = 'label', id = 'cur', label = '当前武器：—' },
-        { type = 'dropdown', id = 'mode', label = '模式', options = modeOptions, default = Cfg.mode,
-          onChange = function(v)
-              Cfg.mode = v
-              saveCfg()
-              log("mode = %s", v)
-              refreshUi()
-          end },
-        { type = 'separator' },
-        { type = 'checkbox', id = 'custrand', label = '自定义池内随机顺序', default = Cfg.customRandom,
-          onChange = function(on)
-              Cfg.customRandom = on and true or false
-              saveCfg()
-              refreshUi()
-          end },
-        { type = 'separator' },
-        { type = 'button', id = 'restore', label = '恢复原始装备（F2）', onClick = function()
-            pcall(restoreOriginal)
-        end },
-        { type = 'label', label = '按游戏原生的主/副武器切换键即可切换。\n关闭 = 完全不干预，恢复原版手感。\n循环 = 按拼音顺序轮换全部已拥有武器。\n随机 = 每次随机换到另一把。\n自定义 = 只在勾选的武器里轮换。' },
-    }
-
-    local poolItems = {}
-    for _, it in ipairs(sw.items) do
-        local checked = poolIsAll() and true or (poolSet[it.id] == true)
-        poolItems[#poolItems + 1] = {
-            type = 'checkbox', id = 'w_' .. it.id, label = it.name .. '  ' .. it.id, default = checked,
-            onChange = function(on)
-                if poolIsAll() then
-                    Cfg.pool = {}
-                    for _, x in ipairs(sw.items) do Cfg.pool[x.id] = true end
-                end
-                Cfg.pool[it.id] = on and true or nil
-                poolSet = Cfg.pool
-                saveCfg()
-                refreshUi()
-            end,
-        }
-    end
-
-    ui.Register({ id = 'swap', title = '武器切换', items = items, collapsible = false })
-    ui.Register({ id = 'pool', title = '自定义池', items = poolItems })
+    ui.Register({ id = 'swap', title = '武器切换', items = swapItems(), collapsible = false })
+    ui.Register({ id = 'pool', title = '自定义池 · ' .. T[Cfg.target].label, items = poolItemsFor(sub, Cfg.target) })
 
     local function refresh()
         local ok, err = pcall(function()
             local sub2 = getSub()
             if not sub2 then return end
-            local sw2 = sortedWeapons(sub2)
-            local curId = curIdOf(sub2)
-            local name = displayOf(sw2, curId)
-            ui.SetLabel('swap', 'cur', string.format('当前武器：%s（%s）', name, curId))
-            local pool = poolFor(sub2, sw2)
-            local txt = poolIsAll() and string.format('全部 %d 把', #sw2.ids)
-                or string.format('%d / %d 把', #pool, #sw2.ids)
-            log("ui refresh: pool %s", txt)
+            local parts = {}
+            for _, kind in ipairs(KINDS) do
+                local sw = sortedWeapons(sub2, kind)
+                local id = curOf(sub2, kind)
+                local label = displayOf(sw, id)
+                local c = Cfg[kind]
+                local modeTxt = (c.mode == "off") and "关闭" or (c.mode == "cycle" and "循环" or (c.mode == "random" and "随机" or "自定义"))
+                parts[#parts + 1] = string.format('%s：%s（%s）', T[kind].label, label or "—", modeTxt)
+            end
+            ui.SetLabel('swap', 'cur', '当前  ' .. table.concat(parts, '   |   '))
+            local swNow = sortedWeapons(sub2, Cfg.target)
+            if swNow then
+                local pool = poolFor(Cfg.target, swNow)
+                local txt = (Cfg[Cfg.target].pool == nil) and string.format('全部 %d 把', #swNow.ids)
+                    or string.format('%d / %d 把', #pool, #swNow.ids)
+                log("ui refresh: %s pool %s", Cfg.target, txt)
+            end
         end)
         if not ok then log("ERR refresh: %s", tostring(err)) end
     end
     funcRefresh = refresh
     ui.OnOpen(refresh)
     menuBuilt = true
-    log("menu built: %d weapons", #sw.items)
+    log("menu built: main %d / shaqi %d", #swMain.items,
+        (sortedWeapons(sub, "shaqi") and #sortedWeapons(sub, "shaqi").items) or 0)
+    for _, kind in ipairs(KINDS) do
+        local sw = sortedWeapons(sub, kind)
+        if sw then
+            for i, it in ipairs(sw.items) do
+                log("order[%s] %2d. %s  key=%s  id=%s", kind, i, it.name, it.key, it.id)
+            end
+        end
+    end
 end
 
 -- 轮询等子系统就绪后建菜单（不要在 mod 加载时做反射）
@@ -534,33 +728,52 @@ pcall(function()
 end)
 
 -- 空闲预置：把“下一把目标武器”提前放进待切槽，按键时原生直接切出它，技能不会被截断
-local function stageNextWeapon()
+local function stageNextWeapon(kind)
+    local c = Cfg[kind]
+    if c.mode == "off" then return end
     local sub = getSub()
     if not sub then return end
-    local sw = sortedWeapons(sub)
+    local sw = sortedWeapons(sub, kind)
     if not sw or #sw.ids == 0 then return end
-    local curId, curIdx = curIdOf(sub)
-    if cursorId == nil then cursorId = curId end
-    local nxt = pickNext(sub, sw, cursorId)
+    local slots, _, cnt = equippedSlots(sub, kind)
+    if cnt < 2 then return end
+    local curId, curIdx = curOf(sub, kind)
+    if cursors[kind] == nil then cursors[kind] = curId end
+    -- 上一把预置的武器已经拿到手上、或被别的操作挤掉，就作废这个标记
+    if pending[kind] then
+        if pending[kind] == curId or slots[pending[kind]] == nil then
+            pending[kind] = nil
+        end
+    end
+    if pending[kind] then return end -- 待切槽里已有武器，等玩家按键
+    local nxt = pickNext(kind, sw, cursors[kind])
     if nxt == nil then return end
-    local slots = equippedSlots(sub)
-    if slots[nxt] ~= nil then return end
+    if slots[nxt] ~= nil then
+        pending[kind] = nxt
+        return
+    end
     local other = (curIdx == 0) and 1 or 0
+    if other >= cnt then other = 0 end
     busy = true
-    local ok, err = pcall(function() sub:ReplaceWeaponByIndex(FName(nxt), other) end)
+    local ok, err = pcall(T[kind].replace, sub, nxt, other)
     busy = false
     if ok then
-        log("stage %s -> slot %d (off-hand)", nxt, other)
+        pending[kind] = nxt
+        log("stage[%s] %s -> slot %d", kind, nxt, other)
     else
-        log("ERR stage: %s", tostring(err))
+        log("ERR stage[%s]: %s", kind, tostring(err))
     end
     refreshUi()
+end
+
+local function anyModeOn()
+    return Cfg.main.mode ~= "off" or Cfg.shaqi.mode ~= "off"
 end
 
 -- 只在“没在换武器过场”时清冷却 + 预置，避免打断原生换武器技能
 local function idleTicker()
     local ok = pcall(function()
-        if Cfg.mode == "off" then idleTicks = 0; return end
+        if not anyModeOn() then idleTicks = 0; return end
         local comp = FindFirstOf("CharacterWeaponsComponent")
         if comp then
             local okT, v = pcall(function() return comp:IsInWeaponTransition() end)
@@ -570,7 +783,8 @@ local function idleTicker()
         if idleTicks < 3 then return end
         idleTicks = 3
         clearCooldown()
-        stageNextWeapon()
+        stageNextWeapon("main")
+        stageNextWeapon("shaqi")
     end)
     if not ok then return false end
     return false
@@ -579,12 +793,16 @@ pcall(function() LoopInGameThreadWithDelay(500, idleTicker) end)
 
 pcall(function()
     RegisterLoadMapPostHook(function()
-        sortedCache = nil
-        cursorId = nil
+        cache.main = nil
+        cache.shaqi = nil
+        cursors.main = nil
+        cursors.shaqi = nil
+        pending.main = nil
+        pending.shaqi = nil
     end)
 end)
 
 loadCfg()
-log("loaded: native-key takeover, F9 menu, F2 restore; mode=%s", Cfg.mode)
+log("loaded v3: main=%s shaqi=%s target=%s; F9 menu, F2 restore", Cfg.main.mode, Cfg.shaqi.mode, Cfg.target)
 
 return { step = step, restore = restoreOriginal, cfg = Cfg }
