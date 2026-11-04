@@ -1,4 +1,4 @@
--- PBZWeaponSwap v3
+-- PBZWeaponSwap v3.1.0
 -- 用游戏原生的换武器键驱动两套武器：
 --   主武器   键盘 1 / 手柄十字键左   -> SetCurrentWeaponByIndex(idx, true)
 --   影之武装 键盘 2 / 手柄十字键右   -> SetCurrentWeaponByIndex(idx, false)
@@ -11,6 +11,7 @@ local LOG_PATH = ROOT .. 'log.txt'
 local CFG_PATH = ROOT .. 'config.txt'
 local SNAP_PATH = ROOT .. 'snapshot.txt'
 local DEBUG = true
+local VERSION = "3.1.0"
 
 local function log(fmt, ...)
     local ok, s = pcall(string.format, fmt, ...)
@@ -112,9 +113,51 @@ local KINDS = { "main", "shaqi" }
 -- Cfg[kind] = { mode = "off"|"cycle"|"random"|"custom", customRandom = bool, pool = { [id]=true } | nil }
 local Cfg = {
     target = "main", -- F9 菜单首行选择：正在配置哪一套
+    lang = "auto",   -- auto = 跟随游戏语言；也可写 zh / en
     main = { mode = "cycle", customRandom = false, pool = nil },
     shaqi = { mode = "cycle", customRandom = false, pool = nil },
 }
+
+-- ── 语言：默认跟随游戏语言，config.txt 里 lang=zh/en 可强制 ──────────
+local LANG = "zh"
+
+local function gameCulture()
+    local ok, lib = pcall(function()
+        return StaticFindObject('/Script/Engine.Default__KismetInternationalizationLibrary')
+    end)
+    if not (ok and lib) then
+        local ok2, lib2 = pcall(FindFirstOf, "KismetInternationalizationLibrary")
+        lib = (ok2 and lib2) or nil
+    end
+    if not lib then return nil end
+    local ok3, v = pcall(function() return lib:GetCurrentLanguage() end)
+    if not ok3 or v == nil then return nil end
+    if type(v) == "string" then return v end
+    local ok4, s = pcall(function() return v:ToString() end)
+    if ok4 and type(s) == "string" then return s end
+    return nil
+end
+
+local function resolveLang()
+    if Cfg.lang == "zh" or Cfg.lang == "en" then
+        LANG = Cfg.lang
+        return
+    end
+    local cult = gameCulture()
+    if cult and cult ~= "" and cult ~= "nil" then
+        local c = string.lower(cult)
+        LANG = (string.find(c, "zh", 1, true) or string.find(c, "chinese", 1, true)) and "zh" or "en"
+        log("game language: %s -> UI %s", cult, LANG)
+    else
+        LANG = "zh"
+        log("game language: not detected -> UI zh (config.txt: lang=zh|en to force)")
+    end
+end
+
+local function L(zh, en)
+    if LANG == "en" then return en end
+    return zh
+end
 
 local function poolIsAll(kind)
     return Cfg[kind].pool == nil
@@ -137,7 +180,9 @@ local function loadCfg()
     f:close()
     for _, kv in ipairs(lines) do
         local k, v = kv.k, kv.v
-        if k == "target" then
+        if k == "lang" then
+            if v == "auto" or v == "zh" or v == "en" then Cfg.lang = v end
+        elseif k == "target" then
             if v == "main" or v == "shaqi" then Cfg.target = v end
         elseif k == "mode" or k == "random" or k == "pool" then
             -- v2 旧格式：只有一套主武器
@@ -170,6 +215,8 @@ end
 local function saveCfg()
     local f = io.open(CFG_PATH, "w")
     if not f then return end
+    f:write("version=", VERSION, "\n")
+    f:write("lang=", Cfg.lang, "\n")
     f:write("target=", Cfg.target, "\n")
     for _, kind in ipairs(KINDS) do
         local c = Cfg[kind]
@@ -550,26 +597,50 @@ do
     if ok and type(mod) == "table" then ui = mod else log("ModMenu load failed: %s", tostring(mod)) end
 end
 
-local MODE_LABEL = {
-    off = "关闭（保留游戏原生行为）",
-    cycle = "循环（按拼音顺序轮换）",
-    random = "随机（每次换到另一把）",
-    custom = "自定义（仅使用勾选的武器）",
-}
+local function labelOf(kind)
+    if kind == "shaqi" then return L("影之武装", "Shaqi weapon") end
+    return L("主武器", "Main weapon")
+end
 
-local modeOptions = {
-    { label = MODE_LABEL.off, value = "off" },
-    { label = MODE_LABEL.cycle, value = "cycle" },
-    { label = MODE_LABEL.random, value = "random" },
-    { label = MODE_LABEL.custom, value = "custom" },
-}
+local function hotkeyOf(kind)
+    if kind == "shaqi" then return L("键盘 2 / 手柄十字键右", "keyboard 2 / D-pad Right") end
+    return L("键盘 1 / 手柄十字键左", "keyboard 1 / D-pad Left")
+end
 
-local targetOptions = {
-    { label = "主武器（键盘 1 / 十字键左）", value = "main" },
-    { label = "影之武装（键盘 2 / 十字键右）", value = "shaqi" },
-}
+local function modeName(m)
+    if m == "off" then return L("关闭", "Off") end
+    if m == "cycle" then return L("循环", "Cycle") end
+    if m == "random" then return L("随机", "Random") end
+    return L("自定义", "Custom")
+end
+
+local function modeOptions()
+    return {
+        { label = L("关闭（保留游戏原生行为）", "Off (vanilla behaviour)"), value = "off" },
+        { label = L("循环（按拼音顺序轮换）", "Cycle (pinyin order)"), value = "cycle" },
+        { label = L("随机（每次换到另一把）", "Random (a different weapon each time)"), value = "random" },
+        { label = L("自定义（仅使用勾选的武器）", "Custom (only ticked weapons)"), value = "custom" },
+    }
+end
+
+local function targetOptions()
+    return {
+        { label = L("主武器（键盘 1 / 十字键左）", "Main weapon (1 / D-pad Left)"), value = "main" },
+        { label = L("影之武装（键盘 2 / 十字键右）", "Shaqi weapon (2 / D-pad Right)"), value = "shaqi" },
+    }
+end
+
+local function langOptions()
+    return {
+        { label = L("自动（跟随游戏语言）", "Auto (follow game language)"), value = "auto" },
+        { label = L("中文", "Chinese"), value = "zh" },
+        { label = "English", value = "en" },
+    }
+end
 
 local menuBuilt = false
+local funcRefreshWeapons = nil
+local registerSections = nil
 
 local function poolItemsFor(sub, kind)
     local sw = sortedWeapons(sub, kind)
@@ -601,9 +672,13 @@ end
 local function swapItems()
     local c = Cfg[Cfg.target]
     return {
-        { type = 'label', id = 'cur', label = '当前：—' },
+        -- 状态区：目标一行，两套武器各一行（原来是挤在一行里的）
+        { type = 'label', id = 'curTarget', label = L("当前目标：—", "Editing: —") },
+        { type = 'label', id = 'curMain', label = L("主武器：—", "Main weapon: —") },
+        { type = 'label', id = 'curShaqi', label = L("影之武装：—", "Shaqi weapon: —") },
+        { type = 'label', id = 'poolInfo', label = L("池：—", "Pool: —") },
         { type = 'separator' },
-        { type = 'dropdown', id = 'target', label = '配置对象', options = targetOptions, default = Cfg.target,
+        { type = 'dropdown', id = 'target', label = L("配置对象", "Configure"), options = targetOptions(), default = Cfg.target,
           onChange = function(v)
               if v ~= "main" and v ~= "shaqi" then return end
               Cfg.target = v
@@ -613,14 +688,14 @@ local function swapItems()
                   pcall(function() ui.Set('swap', 'mode', cc.mode) end)
                   pcall(function() ui.Set('swap', 'custrand', cc.customRandom) end)
                   pcall(function()
-                      ui.Register({ id = 'pool', title = '自定义池 · ' .. T[v].label,
+                      ui.Register({ id = 'pool', title = L('自定义池 · ', 'Custom pool · ') .. labelOf(v),
                           items = poolItemsFor(getSub(), v) })
                   end)
               end
               log("menu target = %s", v)
               refreshUi()
           end },
-        { type = 'dropdown', id = 'mode', label = '切换模式', options = modeOptions, default = c.mode,
+        { type = 'dropdown', id = 'mode', label = L("切换模式", "Mode"), options = modeOptions(), default = c.mode,
           onChange = function(v)
               local kind = Cfg.target
               local m = normMode(v)
@@ -630,7 +705,7 @@ local function swapItems()
               log("[%s] mode = %s", kind, m)
               refreshUi()
           end },
-        { type = 'checkbox', id = 'custrand', label = '自定义池内随机顺序', default = c.customRandom,
+        { type = 'checkbox', id = 'custrand', label = L("自定义池内随机顺序", "Random order inside custom pool"), default = c.customRandom,
           onChange = function(on)
               local kind = Cfg.target
               Cfg[kind].customRandom = on and true or false
@@ -639,20 +714,120 @@ local function swapItems()
               refreshUi()
           end },
         { type = 'separator' },
-        { type = 'button', id = 'restore', label = '恢复原始装备（F2）', onClick = function()
+        { type = 'button', id = 'refresh', label = L("刷新武器列表（加入新获得的武器）", "Refresh weapon list (pick up newly acquired)"), onClick = function()
+            if funcRefreshWeapons then pcall(funcRefreshWeapons, true) end
+        end },
+        { type = 'button', id = 'restore', label = L("恢复原始装备（F2）", "Restore original loadout (F2)"), onClick = function()
             pcall(restoreOriginal)
         end },
-        { type = 'label', label = '首行选择要配置的武器类型，下面四种模式对该类型生效。\n主武器 = 键盘 1 / 手柄十字键左；影之武装 = 键盘 2 / 手柄十字键右。\n关闭 = 完全不干预，恢复原版手感。\n循环 = 按拼音顺序轮换全部武器。\n随机 = 每次随机换到另一把。\n自定义 = 只在勾选的武器里轮换。' },
+        { type = 'separator' },
+        { type = 'dropdown', id = 'lang', label = L("界面语言", "UI language"), options = langOptions(), default = Cfg.lang,
+          onChange = function(v)
+              if v ~= "auto" and v ~= "zh" and v ~= "en" then return end
+              Cfg.lang = v
+              saveCfg()
+              resolveLang()
+              log("menu lang = %s -> %s", v, LANG)
+              local sub = getSub()
+              if ui and sub and registerSections then pcall(registerSections, sub) end
+              refreshUi()
+          end },
+        -- 说明区：两套武器各占一行
+        { type = 'label', label = L("主武器：键盘 1 / 手柄十字键左", "Main weapon: keyboard 1 / D-pad Left") },
+        { type = 'label', label = L("影之武装：键盘 2 / 手柄十字键右", "Shaqi weapon: keyboard 2 / D-pad Right") },
+        { type = 'label', label = L("关闭 = 完全不干预；循环 = 按拼音顺序轮换；随机 = 每次换到另一把；自定义 = 只在勾选的武器里轮换。",
+                                     "Off = no interference; Cycle = rotate in pinyin order; Random = a different weapon each time; Custom = only ticked weapons.") },
+        { type = 'label', label = L("版本 v", "version v") .. VERSION },
     }
 end
+
+registerSections = function(sub)
+    if not ui then return end
+    ui.Register({ id = 'swap', title = L('武器切换', 'Weapon Swap'), items = swapItems(), collapsible = false })
+    ui.Register({ id = 'pool', title = L('自定义池 · ', 'Custom pool · ') .. labelOf(Cfg.target),
+        items = poolItemsFor(sub, Cfg.target) })
+end
+
+local function setStatusLabels()
+    local sub = getSub()
+    if not sub or not ui then return end
+    pcall(function() ui.SetLabel('swap', 'curTarget', L('当前目标：', 'Editing: ') .. labelOf(Cfg.target)) end)
+    for _, kind in ipairs(KINDS) do
+        local sw = sortedWeapons(sub, kind)
+        local id = curOf(sub, kind)
+        local name = displayOf(sw, id) or '—'
+        local txt = labelOf(kind) .. L('：', ': ') .. name .. '  ' .. L('（', '(') .. modeName(Cfg[kind].mode) .. L('）', ')')
+        local itemId = (kind == 'main') and 'curMain' or 'curShaqi'
+        pcall(function() ui.SetLabel('swap', itemId, txt) end)
+    end
+    local swNow = sortedWeapons(sub, Cfg.target)
+    if swNow then
+        local pool = poolFor(Cfg.target, swNow)
+        local txt
+        if Cfg[Cfg.target].pool == nil then
+            txt = L(string.format('全部 %d 把', #swNow.ids), string.format('all %d weapons', #swNow.ids))
+        else
+            txt = L(string.format('%d / %d 把', #pool, #swNow.ids), string.format('%d / %d weapons', #pool, #swNow.ids))
+        end
+        pcall(function() ui.SetLabel('swap', 'poolInfo', L('池：', 'Pool: ') .. txt) end)
+    end
+end
+
+local function weaponCount(sub, kind)
+    local ok, arr = pcall(T[kind].all, sub)
+    if not (ok and arr) then return 0 end
+    local ok2, n = pcall(function() return #arr end)
+    if ok2 and type(n) == "number" then return n end
+    return 0
+end
+
+-- 池里可能新增（新获得武器）或消失（换档/读档），据此判断要不要重建列表
+local function listChanged(sub)
+    for _, kind in ipairs(KINDS) do
+        local n = weaponCount(sub, kind)
+        local c = cache[kind]
+        if n > 0 and (not c or #c.ids ~= n) then return true end
+    end
+    return false
+end
+
+local function refreshWeapons(force)
+    local sub = getSub()
+    if not sub then return end
+    if force or listChanged(sub) then
+        cache.main = nil
+        cache.shaqi = nil
+        pending.main = nil
+        pending.shaqi = nil
+        for _, kind in ipairs(KINDS) do
+            local sw = sortedWeapons(sub, kind)
+            local c = Cfg[kind]
+            if sw and c.pool then
+                for id in pairs(c.pool) do
+                    if not indexOf(sw.ids, id) then c.pool[id] = nil end
+                end
+                if not next(c.pool) then c.pool = nil end
+                saveCfg()
+            end
+        end
+    end
+    resolveLang()
+    if ui then pcall(registerSections, sub) end
+    setStatusLabels()
+    local m = sortedWeapons(sub, 'main')
+    local s = sortedWeapons(sub, 'shaqi')
+    log('refresh: main %d / shaqi %d (forced=%s)', (m and #m.ids) or 0, (s and #s.ids) or 0, tostring(force == true))
+end
+funcRefreshWeapons = refreshWeapons
 
 local function buildMenu(sub)
     if not ui or menuBuilt then return end
     local swMain = sortedWeapons(sub, "main")
     if not swMain or #swMain.items == 0 then return end
+    resolveLang()
 
     ui.Init({
-        title = '武器切换 Weapon Swap',
+        title = L('武器切换 Weapon Swap', 'Weapon Swap'),
         instanceId = 'PBZWeaponSwap',
         key = Key.F9,
         keyHint = 'F9',
@@ -664,38 +839,23 @@ local function buildMenu(sub)
         bottomFrac = 0.12,
     })
 
-    ui.Register({ id = 'swap', title = '武器切换', items = swapItems(), collapsible = false })
-    ui.Register({ id = 'pool', title = '自定义池 · ' .. T[Cfg.target].label, items = poolItemsFor(sub, Cfg.target) })
+    registerSections(sub)
+    setStatusLabels()
 
     local function refresh()
         local ok, err = pcall(function()
             local sub2 = getSub()
             if not sub2 then return end
-            local parts = {}
-            for _, kind in ipairs(KINDS) do
-                local sw = sortedWeapons(sub2, kind)
-                local id = curOf(sub2, kind)
-                local label = displayOf(sw, id)
-                local c = Cfg[kind]
-                local modeTxt = (c.mode == "off") and "关闭" or (c.mode == "cycle" and "循环" or (c.mode == "random" and "随机" or "自定义"))
-                parts[#parts + 1] = string.format('%s：%s（%s）', T[kind].label, label or "—", modeTxt)
-            end
-            ui.SetLabel('swap', 'cur', '当前  ' .. table.concat(parts, '   |   '))
-            local swNow = sortedWeapons(sub2, Cfg.target)
-            if swNow then
-                local pool = poolFor(Cfg.target, swNow)
-                local txt = (Cfg[Cfg.target].pool == nil) and string.format('全部 %d 把', #swNow.ids)
-                    or string.format('%d / %d 把', #pool, #swNow.ids)
-                log("ui refresh: %s pool %s", Cfg.target, txt)
-            end
+            if listChanged(sub2) then pcall(refreshWeapons, false) end
+            setStatusLabels()
         end)
         if not ok then log("ERR refresh: %s", tostring(err)) end
     end
     funcRefresh = refresh
     ui.OnOpen(refresh)
     menuBuilt = true
-    log("menu built: main %d / shaqi %d", #swMain.items,
-        (sortedWeapons(sub, "shaqi") and #sortedWeapons(sub, "shaqi").items) or 0)
+    local swShaqi = sortedWeapons(sub, "shaqi")
+    log("menu built v%s: main %d / shaqi %d", VERSION, #swMain.items, (swShaqi and #swShaqi.items) or 0)
     for _, kind in ipairs(KINDS) do
         local sw = sortedWeapons(sub, kind)
         if sw then
@@ -705,7 +865,6 @@ local function buildMenu(sub)
         end
     end
 end
-
 -- 轮询等子系统就绪后建菜单（不要在 mod 加载时做反射）
 local function tick()
     local ok, err = pcall(function()
@@ -803,6 +962,7 @@ pcall(function()
 end)
 
 loadCfg()
-log("loaded v3: main=%s shaqi=%s target=%s; F9 menu, F2 restore", Cfg.main.mode, Cfg.shaqi.mode, Cfg.target)
+log("loaded v" .. VERSION .. ": lang=%s (resolved when menu builds) main=%s shaqi=%s target=%s; F9 menu, F2 restore",
+    Cfg.lang, Cfg.main.mode, Cfg.shaqi.mode, Cfg.target)
 
 return { step = step, restore = restoreOriginal, cfg = Cfg }
