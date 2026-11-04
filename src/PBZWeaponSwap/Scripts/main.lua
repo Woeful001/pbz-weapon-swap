@@ -11,7 +11,7 @@ local LOG_PATH = ROOT .. 'log.txt'
 local CFG_PATH = ROOT .. 'config.txt'
 local SNAP_PATH = ROOT .. 'snapshot.txt'
 local DEBUG = true
-local VERSION = "4.0.0"
+local VERSION = "4.1.0"
 
 local function log(fmt, ...)
     local ok, s = pcall(string.format, fmt, ...)
@@ -72,9 +72,41 @@ local function S(v)
     return tostring(v)
 end
 
+-- 子系统查找：4.0.0 的 FindFirstOf 对 WorldSubsystem 有时返回 nil，
+-- 这里按 FindFirstOf -> FindAllOf -> FindObject 逐级回退，并只记一次命中的方式。
+local subPath = nil
+local function validSub(o)
+    if not o then return false end
+    local ok, v = pcall(function() return o:IsValid() end)
+    return ok and v
+end
 local function getSub()
     local ok, sub = pcall(FindFirstOf, "PBZBackPackSubsystem")
-    if ok and sub and sub:IsValid() then return sub end
+    if ok and validSub(sub) then
+        if subPath ~= "FindFirstOf" then subPath = "FindFirstOf"; log("subsystem via FindFirstOf") end
+        return sub
+    end
+    local okA, arr = pcall(FindAllOf, "PBZBackPackSubsystem")
+    if okA and arr then
+        local n = 0
+        pcall(function() n = arr:GetArrayNum() end)
+        for i = 1, (n or 0) do
+            local okI, el = pcall(function() return arr[i] end)
+            if okI and el then
+                local okG, inst = pcall(function() return el:get() end)
+                inst = okG and inst or el
+                if validSub(inst) then
+                    if subPath ~= "FindAllOf" then subPath = "FindAllOf"; log("subsystem via FindAllOf[%d]", i) end
+                    return inst
+                end
+            end
+        end
+    end
+    local okO, o = pcall(FindObject, nil, "PBZBackPackSubsystem")
+    if okO and validSub(o) then
+        if subPath ~= "FindObject" then subPath = "FindObject"; log("subsystem via FindObject") end
+        return o
+    end
     return nil
 end
 
@@ -90,8 +122,6 @@ local T = {
         curId = function(sub) return sub.CurrentMainWeaponID end,
         replace = function(sub, id, slot) sub:ReplaceWeaponByIndex(FName(id), slot) end,
         setCur = function(sub, idx) sub:SetCurrentWeaponByIndex(idx, true) end,
-        tbl = function(sub, fn) return sub:GetMainWeaponTableData(fn) end,
-        all = function(sub) return sub:GetAllNormalWeapons() end,
     },
     shaqi = {
         key = "shaqi",
@@ -103,8 +133,6 @@ local T = {
         curId = function(sub) return nil end,
         replace = function(sub, id, slot) sub:ReplaceShaqiWeaponByIndex(FName(id), slot) end,
         setCur = function(sub, idx) sub:SetCurrentWeaponByIndex(idx, false) end,
-        tbl = function(sub, fn) return sub:GetShaqiWeaponTableData(fn) end,
-        all = function(sub) return sub:GetAllShaqiWeapons() end,
     },
 }
 local KINDS = { "main", "shaqi" }
@@ -262,35 +290,36 @@ local function curOf(sub, kind)
     return okD and S(id) or nil, idx
 end
 
+-- 武器 ID → 游戏内中文显示名（内置，避免在 4.x 上调用 GetMainWeaponTableData 触发崩溃）
+local NAMES = {
+    main = {
+        Tang = "黑伤", WoodenSwordHun = "木制黑伤", Double = "黑伤双刃", IronBlade = "残钢刃",
+        Long = "长形黑伤", GuiTouBlade = "红妆鬼斩", ChiZheCanJian = "痴者残剑", ZhanMaBlade = "亡命斩马刀",
+        SnakeDual = "白蟒赤练", RenOuQingTongJian = "天玄青铜剑", YuuBlade = "妖锯", LuanYing = "乱莺剑",
+        PoJun = "破军", SlitheringSword = "灵蛇软剑", BaiShanShuangJian = "白山风雷剑", DualHook = "别离残钩",
+        TianShaShuangYue = "天煞双钺", HorizontalBlade = "荡寇凶刃", JadeDualChakram = "玉双环", BaiYing = "白影",
+        CiGuHunDun = "刺骨混沌", RenOuYanYueDao = "偃月刀", Jigsaw = "断肢锯", FangHuaXieShan = "圣母邪扇",
+        ZiMingJian = "紫冥剑",
+    },
+    shaqi = {
+        JinGua = "长柄金瓜", JianKeZhaoJiLing = "剑客召集令", ThunderSpear = "雷霆枪", CuiXinPiPa = "催心琵琶",
+        MoJian = "墨血无痕", MiaoShouFeiDao = "妙手飞刀", BrutalAxe = "巨凶斧", ZhuoBiDun = "拙壁盾",
+        CaoOuSiXian = "操偶铃铛", NiTouche = "泥头车", YouLongCha = "游龙叉", YouLongTou = "游龙头",
+        HuoLiuXing = "火流星", LionHead = "烈焰狮头", DuYanGong = "独眼弓", UnnamedBow = "羽弓",
+        KuYeSiZhuChuan = "苦叶寺珠串", TigerCannon = "虎炮", XuKongHuaShan = "虚空华扇", XueDiZi = "血滴子",
+        TanLang = "贪狼", ShachiHook = "追命锁镰", TieGongZhuQuanTao = "铁拳套", HuangJinHuoChong = "黄金火铳",
+    },
+}
+
 local cache = { main = nil, shaqi = nil }
 
 local function sortedWeapons(sub, kind)
     if cache[kind] then return cache[kind] end
-    local def = T[kind]
-    local ok, arr = pcall(def.all, sub)
-    if not ok or arr == nil then return nil end
+    local names = NAMES[kind]
+    if not names then return nil end
     local items = {}
-    local n = #arr
-    for i = 1, n do
-        local okP, p = pcall(function() return arr[i] end)
-        if okP and p ~= nil then
-            local okG, raw = pcall(function() return p:get() end)
-            local fn = okG and raw or p
-            local id = S(fn)
-            local disp = id
-            local okT, t = pcall(def.tbl, sub, fn)
-            if okT and t ~= nil then
-                local okW, wn = pcall(function() return t.WeaponName end)
-                if okW and wn ~= nil then
-                    local okV, vc = pcall(function() return wn.ValueCache end)
-                    if okV and vc ~= nil then
-                        local s = S(vc)
-                        if s ~= "nil" and s ~= "" then disp = s end
-                    end
-                end
-            end
-            items[#items + 1] = { id = id, name = disp, key = pinyin(disp) }
-        end
+    for id, zh in pairs(names) do
+        items[#items + 1] = { id = id, name = zh, key = pinyin(zh) }
     end
     table.sort(items, function(a, b)
         if a.key == b.key then return a.id < b.id end
@@ -602,7 +631,10 @@ local function onSetWeaponByIndex(ctx, idxParam, isNormalParam)
         end
     end)
     if not ok then log("ERR hook: %s", tostring(err)) end
-    return false -- 不拦原生调用：只把目标武器放进原生要切的槽，让原生完成这次切换
+    -- UE4SS 4.0.0：hook 回调的返回值会被写进 UFunction 的返回槽，
+    -- 对 void 函数（SetCurrentWeaponByIndex 就是）会踩空指针直接崩游戏，
+    -- 所以这里必须返回 nil（即不写 return 值）。
+    return nil
 end
 
 do
@@ -800,12 +832,14 @@ local function setStatusLabels()
     end
 end
 
+-- 4.x 下 GetAllNormalWeapons() 的返回形态不稳定（且 GetMainWeaponTableData 会崩），
+-- 这里直接用内置名单计数，不再碰引擎侧列表接口
 local function weaponCount(sub, kind)
-    local ok, arr = pcall(T[kind].all, sub)
-    if not (ok and arr) then return 0 end
-    local ok2, n = pcall(function() return #arr end)
-    if ok2 and type(n) == "number" then return n end
-    return 0
+    local names = NAMES[kind]
+    if not names then return 0 end
+    local n = 0
+    for _ in pairs(names) do n = n + 1 end
+    return n
 end
 
 -- 池里可能新增（新获得武器）或消失（换档/读档），据此判断要不要重建列表
