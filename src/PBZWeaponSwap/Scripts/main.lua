@@ -11,7 +11,7 @@ local LOG_PATH = ROOT .. 'log.txt'
 local CFG_PATH = ROOT .. 'config.txt'
 local SNAP_PATH = ROOT .. 'snapshot.txt'
 local DEBUG = true
-local VERSION = "4.1.0"
+local VERSION = "4.0.0"
 
 local function log(fmt, ...)
     local ok, s = pcall(string.format, fmt, ...)
