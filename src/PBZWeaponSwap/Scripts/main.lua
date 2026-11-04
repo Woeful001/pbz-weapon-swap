@@ -1,4 +1,4 @@
--- PBZWeaponSwap v3.1.0
+-- PBZWeaponSwap v3.1.1
 -- 用游戏原生的换武器键驱动两套武器：
 --   主武器   键盘 1 / 手柄十字键左   -> SetCurrentWeaponByIndex(idx, true)
 --   影之武装 键盘 2 / 手柄十字键右   -> SetCurrentWeaponByIndex(idx, false)
@@ -11,7 +11,7 @@ local LOG_PATH = ROOT .. 'log.txt'
 local CFG_PATH = ROOT .. 'config.txt'
 local SNAP_PATH = ROOT .. 'snapshot.txt'
 local DEBUG = true
-local VERSION = "3.1.0"
+local VERSION = "4.0.0"
 
 local function log(fmt, ...)
     local ok, s = pcall(string.format, fmt, ...)
@@ -507,6 +507,21 @@ end
 -- ── 拦截游戏原生切换：SetCurrentWeaponByIndex(index, isNormal)──────
 local stats = { hits = 0, hits_shaqi = 0 }
 local idleTicks = 0 -- 距上次原生切换经过的 tick 数（空闲时才预置待切武器）
+local stageUrgent = false -- 刚切过一次：尽快补预置，别等满 1.5 秒，否则下一把来不及备好、技能会被跳过
+
+-- 地图切换护栏：切换大地图时世界/子系统/组件都会被销毁重建，
+-- 这期间任何 ReplaceWeaponByIndex / ResetChangeWeaponCooldowns 都可能踩到半死对象。
+local switchingMap = false
+local worldGuardUntil = 0 -- os.time() 秒：落地后仍冻结一段时间再恢复
+local menuStale = false
+local lastWorldAddr = nil -- 轮询 World 对象地址判定切图（不再用 LoadMap 钩子）
+local resetWeaponState  -- 前向声明，实体定义在文件后段
+
+local function inMapTransition()
+    if switchingMap then return true end
+    if os.time() < worldGuardUntil then return true end
+    return false
+end
 
 local function readParam(p, default)
     if p == nil then return default end
@@ -518,6 +533,7 @@ end
 local function onSetWeaponByIndex(ctx, idxParam, isNormalParam)
     local ok, err = pcall(function()
         if busy then return end
+        if inMapTransition() then return end
         local idx = readParam(idxParam, nil)
         if idx == nil or type(idx) ~= "number" then return end
         local isNormal = readParam(isNormalParam, true)
@@ -534,8 +550,10 @@ local function onSetWeaponByIndex(ctx, idxParam, isNormalParam)
         stats.hits = stats.hits + 1
         if kind == "shaqi" then stats.hits_shaqi = stats.hits_shaqi + 1 end
         idleTicks = 0
-        log("intercept[%s] native switch: idx=%s cur=%s (hit %d, shaqi %d)",
-            kind, tostring(idx), tostring(cur), stats.hits, stats.hits_shaqi)
+        stageUrgent = true
+        local pre = pending[kind]
+        log("intercept[%s] native switch: idx=%s cur=%s pre=%s (hit %d, shaqi %d)",
+            kind, tostring(idx), tostring(cur), tostring(pre), stats.hits, stats.hits_shaqi)
         -- 原生切换无法取消：目标武器若已在待切槽就直接让原生用它（技能完整播放）；
         -- 否则才在切换瞬间补写一次（仅在未预置的边缘情况发生）。
         local ok2, e2 = pcall(function()
@@ -567,12 +585,15 @@ local function onSetWeaponByIndex(ctx, idxParam, isNormalParam)
             pending[kind] = nil
             cursors[kind] = target
             ExecuteInGameThreadWithDelay(200, function()
-                local s2 = getSub()
-                if s2 then
-                    local id2, i2 = curOf(s2, kind)
-                    log("after native[%s]: cur=%s idx=%s", kind, tostring(id2), tostring(i2))
-                end
-                refreshUi()
+                pcall(function()
+                    if inMapTransition() then return end
+                    local s2 = getSub()
+                    if s2 then
+                        local id2, i2 = curOf(s2, kind)
+                        log("after native[%s]: cur=%s idx=%s", kind, tostring(id2), tostring(i2))
+                    end
+                    refreshUi()
+                end)
             end)
         end)
         if not ok2 then
@@ -852,6 +873,11 @@ local function buildMenu(sub)
         local ok, err = pcall(function()
             local sub2 = getSub()
             if not sub2 then return end
+            if menuStale then
+                menuStale = false
+                pcall(refreshWeapons, true)
+                return
+            end
             if listChanged(sub2) then pcall(refreshWeapons, false) end
             setStatusLabels()
         end)
@@ -872,12 +898,56 @@ local function buildMenu(sub)
     end
 end
 -- 轮询等子系统就绪后建菜单（不要在 mod 加载时做反射）
+-- 不用 RegisterLoadMapPreHook/PostHook：UE4SS v3.0.1 下多个 Lua mod 同时注册，
+-- 会在“设置 LoadMap 返回值”这条路径上冲突（日志：both mods tried to set the same return value），
+-- 实测切大地图必崩。改为每 tick 比较 World 对象地址来判定切图。
+local function currentWorld()
+    local okH, H = pcall(require, "UEHelpers")
+    if okH and type(H) == "table" then
+        local okW, w = pcall(H.GetWorld)
+        if okW and w then return w end
+    end
+    local okF, w2 = pcall(function() return FindFirstOf("World") end)
+    if okF then return w2 end
+    return nil
+end
+
+local function pollWorldChange()
+    local w = currentWorld()
+    if not w then return end
+    local okA, addr = pcall(function() return w:GetAddress() end)
+    if not okA or type(addr) ~= "number" or addr == 0 then return end
+    if lastWorldAddr == nil then
+        lastWorldAddr = addr
+        return
+    end
+    if addr ~= lastWorldAddr then
+        log("world changed: 0x%X -> 0x%X, weapons frozen", lastWorldAddr, addr)
+        lastWorldAddr = addr
+        switchingMap = true
+        worldGuardUntil = os.time() + 10
+        menuStale = true
+        pcall(resetWeaponState)
+        if ui and menuBuilt then pcall(function() ui.Close() end) end
+    end
+    if switchingMap and os.time() >= worldGuardUntil then
+        switchingMap = false
+        log("world guard over: weapons resume")
+    end
+end
+
 local function tick()
     local ok, err = pcall(function()
+        pollWorldChange()
+        if inMapTransition() then return end
         local sub = getSub()
         if sub then
             ensureSnapshot()
             if not menuBuilt then buildMenu(sub) end
+            if menuStale then
+                menuStale = false
+                log("map load done: menu data will refresh on next open")
+            end
         end
     end)
     if not ok then log("tick: %s", tostring(err)) end
@@ -888,7 +958,12 @@ pcall(function() LoopInGameThreadWithDelay(1500, tick) end)
 -- ── 备用热键 ───────────────────────────────────────────────────────
 pcall(function()
     RegisterKeyBind(Key.F2, {}, function()
-        pcall(function() ExecuteInGameThread(restoreOriginal) end)
+        pcall(function()
+            ExecuteInGameThread(function()
+                if inMapTransition() then return end
+                restoreOriginal()
+            end)
+        end)
     end)
 end)
 
@@ -896,8 +971,11 @@ end)
 local function stageNextWeapon(kind)
     local c = Cfg[kind]
     if c.mode == "off" then return end
+    if inMapTransition() then return end
     local sub = getSub()
     if not sub then return end
+    local okV, live = pcall(function() return sub:IsValid() end)
+    if not okV or not live then return end
     local sw = sortedWeapons(sub, kind)
     if not sw or #sw.ids == 0 then return end
     local slots, _, cnt = equippedSlots(sub, kind)
@@ -939,14 +1017,17 @@ end
 local function idleTicker()
     local ok = pcall(function()
         if not anyModeOn() then idleTicks = 0; return end
+        if inMapTransition() then idleTicks = 0; return end
         local comp = FindFirstOf("CharacterWeaponsComponent")
         if comp then
             local okT, v = pcall(function() return comp:IsInWeaponTransition() end)
             if okT and v then idleTicks = 0; return end
         end
         idleTicks = idleTicks + 1
-        if idleTicks < 3 then return end
-        idleTicks = 3
+        local need = stageUrgent and 1 or 3
+        if idleTicks < need then return end
+        idleTicks = need
+        stageUrgent = false
         clearCooldown()
         stageNextWeapon("main")
         stageNextWeapon("shaqi")
@@ -956,16 +1037,16 @@ local function idleTicker()
 end
 pcall(function() LoopInGameThreadWithDelay(500, idleTicker) end)
 
-pcall(function()
-    RegisterLoadMapPostHook(function()
-        cache.main = nil
-        cache.shaqi = nil
-        cursors.main = nil
-        cursors.shaqi = nil
-        pending.main = nil
-        pending.shaqi = nil
-    end)
-end)
+resetWeaponState = function()
+    cache.main = nil
+    cache.shaqi = nil
+    cursors.main = nil
+    cursors.shaqi = nil
+    pending.main = nil
+    pending.shaqi = nil
+    idleTicks = 0
+end
+
 
 loadCfg()
 log("loaded v" .. VERSION .. ": lang=%s (resolved when menu builds) main=%s shaqi=%s target=%s; F9 menu, F2 restore",
