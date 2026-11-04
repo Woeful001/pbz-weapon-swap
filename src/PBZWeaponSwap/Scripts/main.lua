@@ -735,8 +735,14 @@ local function swapItems()
         -- 说明区：两套武器各占一行
         { type = 'label', label = L("主武器：键盘 1 / 手柄十字键左", "Main weapon: keyboard 1 / D-pad Left") },
         { type = 'label', label = L("影之武装：键盘 2 / 手柄十字键右", "Shaqi weapon: keyboard 2 / D-pad Right") },
-        { type = 'label', label = L("关闭 = 完全不干预；循环 = 按拼音顺序轮换；随机 = 每次换到另一把；自定义 = 只在勾选的武器里轮换。",
-                                     "Off = no interference; Cycle = rotate in pinyin order; Random = a different weapon each time; Custom = only ticked weapons.") },
+        { type = 'label', label = L("关闭：完全不干预，保持游戏原生行为。",
+                                     "Off: no interference, vanilla behaviour.") },
+        { type = 'label', label = L("循环：按中文名拼音顺序轮换，走完池里所有武器再回到第一把。",
+                                     "Cycle: rotate in pinyin order through the whole pool, then wrap around.") },
+        { type = 'label', label = L("随机：每次换到池里另一把，不会连续两次拿到同一把。",
+                                     "Random: a different weapon from the pool each time, never the same twice in a row.") },
+        { type = 'label', label = L("自定义：只在勾选的武器里按上面的顺序 / 随机规则切换。",
+                                     "Custom: only the ticked weapons are used, with the rule above.") },
         { type = 'label', label = L("版本 v", "version v") .. VERSION },
     }
 end
