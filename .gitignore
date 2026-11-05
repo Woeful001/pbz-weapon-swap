@@ -4,3 +4,4 @@ dist/
 log.txt
 snapshot.txt
 *.bak-*
+archive/
