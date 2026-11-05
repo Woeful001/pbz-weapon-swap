@@ -780,7 +780,24 @@ function M.Debug(msg)
 end
 
 function M.IsValid(obj)
-    return obj ~= nil and type(obj.IsValid) == "function" and obj:IsValid()
+    if obj == nil then
+        return false
+    end
+    -- 4.x: touching a method on a destroyed UObject can fault the process.
+    -- Prefer the engine-side global, and fall back to a pcall'd method call.
+    local okG, res = pcall(function()
+        return IsValid(obj)
+    end)
+    if okG and type(res) == "boolean" then
+        return res
+    end
+    if type(obj.IsValid) ~= "function" then
+        return false
+    end
+    local ok, v = pcall(function()
+        return obj:IsValid()
+    end)
+    return ok and v == true
 end
 
 --- ComboBoxString / FText / FString userdata — normalize before compare/store.
@@ -7183,6 +7200,16 @@ function M.Open(S, opts)
     if not Build.Ensure(S) then
         return
     end
+    if not IsValid(S.menuRoot) then
+        -- 世界重建后 shell 可能只剩失效句柄：清状态等下次按键整块重建，
+        -- 绝不对已销毁的 UMG 调 SetVisibility（4.x 下直接 fault）。
+        S.menuRoot = nil
+        S.contentBox = nil
+        S.contentDirty = true
+        Session.ClearLive(S)
+        Log("OPEN aborted: shell lost after rebuild")
+        return
+    end
     -- Keep the UMG tree across open/close. Create already builds content;
     -- rebuilding here respawns every searchable row (Give, keybinds, …).
     -- contentDirty: Register / SetOptions while closed after the first open.
@@ -7220,6 +7247,25 @@ function M.Open(S, opts)
 end
 
 function M.Close(S)
+    if not IsValid(S.menuRoot) then
+        -- 旧控件随世界一起销毁：只清会话状态，一个 UMG 调用都不做。
+        S.menuRoot = nil
+        S.contentBox = nil
+        S.menuScroll = nil
+        S.menuCanvas = nil
+        S.panelSlot = nil
+        S.panelBorder = nil
+        S.panelOutline = nil
+        S.confirm = nil
+        S.confirmRoot = nil
+        S.confirmSlot = nil
+        S.confirmControls = nil
+        S.contentDirty = true
+        Session.ClearLive(S)
+        S.menuOpen = false
+        Log("CLOSE skipped: shell already gone (state reset)")
+        return
+    end
     Confirm.Hide(S, "close")
     M.StopPoll(S)
     if S.cursorShowHandle ~= nil then
@@ -7242,7 +7288,9 @@ end
 
 function M.Toggle(S)
     -- Close is never gated. Open (and recover-to-open) respects canOpen.
-    if S.menuOpen and IsValid(S.menuRoot) and Session.IsVisible(S) then
+    -- 只信 menuOpen：对可能已销毁的根节点调 GetVisibility/IsVisible 会 fault。
+    local shouldClose = S.menuOpen == true
+    if shouldClose then
         M.Close(S)
     else
         M.Open(S)

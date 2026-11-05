@@ -1,4 +1,4 @@
--- PBZWeaponSwap v3.1.1
+-- PBZWeaponSwap v4.1.0
 -- 用游戏原生的换武器键驱动两套武器：
 --   主武器   键盘 1 / 手柄十字键左   -> SetCurrentWeaponByIndex(idx, true)
 --   影之武装 键盘 2 / 手柄十字键右   -> SetCurrentWeaponByIndex(idx, false)
@@ -11,7 +11,7 @@ local LOG_PATH = ROOT .. 'log.txt'
 local CFG_PATH = ROOT .. 'config.txt'
 local SNAP_PATH = ROOT .. 'snapshot.txt'
 local DEBUG = true
-local VERSION = "4.0.0"
+local VERSION = "4.1.0"
 
 local function log(fmt, ...)
     local ok, s = pcall(string.format, fmt, ...)
@@ -545,6 +545,10 @@ local worldGuardUntil = 0 -- os.time() 秒：落地后仍冻结一段时间再�
 local menuStale = false
 local lastWorldAddr = nil -- 轮询 World 对象地址判定切图（不再用 LoadMap 钩子）
 local resetWeaponState  -- 前向声明，实体定义在文件后段
+local TOGGLE_MIN_GAP = 0.45 -- F9 连按节流（秒）
+local lastToggleAt = 0
+local invWidget = nil -- 背包界面控件缓存（打开背包时自动关菜单）
+local inventoryVisible -- 前向声明，实体在文件后段（F9 防抖里要用来挡“背包开着按 F9”）
 
 local function inMapTransition()
     if switchingMap then return true end
@@ -919,6 +923,66 @@ local function buildMenu(sub)
     end
     funcRefresh = refresh
     ui.OnOpen(refresh)
+
+    -- F9 防抖：ModMenu 的按键回调每帧直接调 Lifecycle.Toggle（无节流），
+    -- 连按时“拆界面”和“建界面”会重叠执行，实测必崩。
+    -- 输入回调每次都会 `Lifecycle.Toggle(S)` 现查表，替换模块字段即可全局生效。
+    local okL, LC = pcall(require, "PBZWSMenu.shell.lifecycle")
+    if okL and type(LC) == "table" and type(LC.Toggle) == "function" and not LC.__wsGuarded then
+        local origToggle = LC.Toggle
+        LC.__wsGuarded = true
+        LC.Toggle = function(S)
+            local now = os.clock()
+            if now - lastToggleAt < TOGGLE_MIN_GAP then
+                log("toggle ignored: only %.2fs since last press", now - lastToggleAt)
+                return
+            end
+            -- 背包开着时不允许弹出菜单（两套 UMG 同时抢输入会崩）
+            if not (S and S.menuOpen) and inventoryVisible and inventoryVisible() then
+                log("toggle ignored: inventory is open")
+                return
+            end
+            lastToggleAt = now
+            local closing = (S and S.menuOpen) == true
+            log("toggle: %s", closing and "close" or "open")
+            local r = origToggle(S)
+            log("toggle done: %s", closing and "close" or "open")
+            return r
+        end
+        log("toggle guard installed: min gap %.2fs", TOGGLE_MIN_GAP)
+    else
+        log("toggle guard NOT installed (lifecycle=%s)", tostring(LC))
+    end
+
+    -- 关闭路径分段追踪：ModMenu.Close 依次调 5 个引擎相关步骤，
+    -- 4.x 下不知道崩在哪一步，逐段打点，日志里最后一个 trace> 就是崩溃点。
+    local traced = {}
+    local function traceFn(modName, key, tag)
+        local okM, mod = pcall(require, modName)
+        if not okM or type(mod) ~= "table" then
+            log("trace skip: %s not loaded", modName)
+            return
+        end
+        if traced[tag] then return end
+        local f = mod[key]
+        if type(f) ~= "function" then
+            log("trace skip: %s.%s missing", modName, key)
+            return
+        end
+        traced[tag] = true
+        mod[key] = function(...)
+            log("trace> %s", tag)
+            local r = f(...)
+            log("trace< %s", tag)
+            return r
+        end
+    end
+    traceFn("PBZWSMenu.shell.confirm", "Hide", "Confirm.Hide")
+    traceFn("PBZWSMenu.core.input", "ClearClickState", "Input.ClearClickState")
+    traceFn("PBZWSMenu.widgets.dropdown", "collapseAll", "Dropdown.collapseAll")
+    traceFn("PBZWSMenu.core.cursor", "Hide", "Cursor.Hide")
+    traceFn("PBZWSMenu.core.inputmode", "SetActive", "InputMode.SetActive")
+
     menuBuilt = true
     local swShaqi = sortedWeapons(sub, "shaqi")
     log("menu built v%s: main %d / shaqi %d", VERSION, #swMain.items, (swShaqi and #swShaqi.items) or 0)
@@ -1001,6 +1065,89 @@ pcall(function()
     end)
 end)
 
+-- ── 等级诊断（F4）────────────────────────────────────────────────
+-- 25 级武器被动依赖等级数据；若换装把 MainWeaponInfos 里的等级重置成 1，
+-- 效果自然不触发。这里逐步问引擎要数据，崩在哪一步日志里就能看出来。
+-- 背包联动：背包一露头就关掉模组菜单。
+-- 菜单开着进背包时，两套 UMG 同时抢 UI 输入模式（InputMode / 光标），实测会崩。
+-- 探测顺序：① PBZBackPackSubsystem:GetInventoryWidget()（游戏自带的访问器，最准）
+--           ② FindFirstOf("PBZInventoryWidget")（C++ 基类，兜底）
+local invNextProbe = 0
+
+local probeHow = nil
+
+-- 4.x 下对已销毁的 UObject 解析 IsValid 方法会硬崩，优先用引擎侧全局 IsValid；
+-- 两种方式都问不出来时按“仍然有效”处理，避免每 tick 丢弃缓存对象反复重建。
+local function objValid(w)
+    if w == nil then return false end
+    local okG, gv = pcall(function() return IsValid(w) end)
+    if okG and type(gv) == "boolean" then return gv end
+    local okM, mv = pcall(function() return w:IsValid() end)
+    if okM and type(mv) == "boolean" then return mv end
+    return true
+end
+
+local function widgetVisible(w)
+    if not w then return false end
+    if not objValid(w) then return false end
+    local okI, vis = pcall(function() return w:IsVisible() end)
+    if okI and type(vis) == "boolean" then return vis end
+    local okG, gv = pcall(function() return w:GetVisibility() end)
+    if okG and gv ~= nil then
+        local s = tostring(gv)
+        return not (s:find("Collapsed") or s:find("Hidden"))
+    end
+    return false
+end
+
+local function probeInventoryWidget()
+    local sub = getSub()
+    if sub then
+        local ok, w = pcall(function() return sub:GetInventoryWidget() end)
+        if ok and w and objValid(w) then
+            return w, "sub:GetInventoryWidget"
+        end
+    end
+    local ok2, w2 = pcall(function() return FindFirstOf("PBZInventoryWidget") end)
+    if ok2 and w2 then return w2, "FindFirstOf(PBZInventoryWidget)" end
+    return nil, nil
+end
+
+local function inventoryVisible_impl()
+    local now = os.clock()
+    if invWidget and not objValid(invWidget) then
+        invWidget = nil
+    end
+    if not invWidget and now >= invNextProbe then
+        invNextProbe = now + 1.0
+        local w, how = probeInventoryWidget()
+        if w then
+            invWidget = w
+            if probeHow ~= how then
+                probeHow = how
+                log("inventory widget found via %s", tostring(how))
+            end
+        end
+    end
+    return widgetVisible(invWidget)
+end
+inventoryVisible = inventoryVisible_impl
+
+local function inventoryGuardTick()
+    local ok, err = pcall(function()
+        if not (ui and menuBuilt) then return end
+        if inMapTransition() then return end
+        if not ui.IsOpen() then return end
+        if inventoryVisible() then
+            pcall(function() ui.Close() end)
+            log("inventory opened -> menu auto closed")
+        end
+    end)
+    if not ok then log("invGuard: %s", tostring(err)) end
+    return false
+end
+pcall(function() LoopInGameThreadWithDelay(150, inventoryGuardTick) end)
+
 -- 空闲预置：把“下一把目标武器”提前放进待切槽，按键时原生直接切出它，技能不会被截断
 local function stageNextWeapon(kind)
     local c = Cfg[kind]
@@ -1079,6 +1226,7 @@ resetWeaponState = function()
     pending.main = nil
     pending.shaqi = nil
     idleTicks = 0
+    invWidget = nil
 end
 
 
