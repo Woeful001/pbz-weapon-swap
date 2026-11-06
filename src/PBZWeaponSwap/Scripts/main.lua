@@ -1,4 +1,4 @@
--- PBZWeaponSwap v4.5.1
+-- PBZWeaponSwap v4.5.5
 -- 用游戏原生的换武器键驱动两套武器：
 --   主武器   键盘 1 / 手柄十字键左   -> SetCurrentWeaponByIndex(idx, true)
 --   影之武装 键盘 2 / 手柄十字键右   -> SetCurrentWeaponByIndex(idx, false)
@@ -19,7 +19,10 @@ local LOG_PATH = ROOT .. 'log.txt'
 local CFG_PATH = ROOT .. 'config.txt'
 local SNAP_PATH = ROOT .. 'snapshot.txt'
 local DEBUG = true
-local VERSION = "4.5.1"
+local VERSION = "4.5.5"
+
+-- random 模式用 math.random，不播种的话每次启动都是同一串顺序
+pcall(math.randomseed, os.time())
 
 local function log(fmt, ...)
     local ok, s = pcall(string.format, fmt, ...)
@@ -197,11 +200,6 @@ local function L(zh, en)
     return zh
 end
 
-local function poolIsAll(kind)
-    local p = Cfg[kind].pool
-    return p == nil or next(p) == nil
-end
-
 local function normMode(v)
     if v == "off" or v == "cycle" or v == "random" then return v end
     return nil
@@ -264,9 +262,13 @@ local function loadCfg()
                 elseif field == "cd" then
                     Cfg[kind].cd = (v == "1" or v == "true") -- 旧格式，仅用于迁移
                 elseif field == "pool" then
-                    local pool = {}
-                    for id in v:gmatch("[^,]+") do pool[id] = true end
-                    Cfg[kind].pool = (next(pool) ~= nil) and pool or nil
+                    if v == "-" then
+                        Cfg[kind].pool = {}   -- 落盘的“一个都不勾”：不能退化成“全部”
+                    else
+                        local pool = {}
+                        for id in v:gmatch("[^,]+") do pool[id] = true end
+                        Cfg[kind].pool = (next(pool) ~= nil) and pool or nil
+                    end
                 end
             end
         end
@@ -289,7 +291,8 @@ local function saveCfg()
             local ids = {}
             for id in pairs(c.pool) do ids[#ids + 1] = id end
             table.sort(ids)
-            f:write(kind, ".pool=", table.concat(ids, ","), "\n")
+            -- 空池写成 "-"：写成空值再读回来会被当成“全部武器”
+            f:write(kind, ".pool=", (#ids > 0) and table.concat(ids, ",") or "-", "\n")
         end
     end
     f:close()
@@ -318,7 +321,9 @@ local function curOf(sub, kind)
     local def = T[kind]
     local _, order, cnt = equippedSlots(sub, kind)
     local okI, idx = pcall(def.curIdx, sub)
-    if okI and type(idx) == "number" and idx >= 0 and idx < cnt and order[idx + 1] then
+    -- pcall 失败时第二个返回值是错误字符串，不能让字符串冒充下标传给调用方
+    if not (okI and type(idx) == "number") then idx = nil end
+    if idx and idx >= 0 and idx < cnt and order[idx + 1] then
         return order[idx + 1], idx
     end
     local okD, id = pcall(def.curId, sub)
@@ -407,7 +412,6 @@ end
 -- 另一套的预置（ReplaceWeaponByIndex）同样会把冷却刷掉，所以这里是全局判断。
 -- 模组自己调用 setCur 时，不要把这次调用当成玩家的按键再拦一遍（否则会自激振荡）
 local hookMuteUntil = 0
-local armedKind, armedUntil = nil, 0   -- 选完后等待下一次按键放行，交给游戏原生切换
 local function muteHook(sec)
     hookMuteUntil = os.clock() + (sec or 0.2)
 end
@@ -466,6 +470,12 @@ local function applyTarget(sub, kind, target, sw)
     log("[%s] state: cur=%s idx=%s slots=[%s]", kind, tostring(afterId), tostring(afterIdx), table.concat(order, ","))
 end
 
+local function inPool(kind, id)
+    local c = Cfg[kind]
+    if c.pool == nil then return true end
+    return c.pool[id] == true
+end
+
 local function poolFor(kind, sw)
     local c = Cfg[kind]
     if c.pool == nil then return sw.ids end
@@ -476,6 +486,8 @@ end
 
 -- 原生切换会同时改掉当前索引，所以循环位置用本模组自己的游标，不依赖游戏当前值
 local cursors = { main = nil, shaqi = nil }
+local emptyPoolLogged = {}
+local singleSlotWarned = {}
 -- 已经预置到待切槽、但玩家还没按键的武器：避免随机模式下每个 tick 都换一把塞进去
 local pending = { main = nil, shaqi = nil }
 local pendingAt = { main = 0, shaqi = 0 }   -- 4.8.9：装填标记的写入时间，超时自动作废
@@ -483,7 +495,14 @@ local pendingAt = { main = 0, shaqi = 0 }   -- 4.8.9：装填标记的写入时�
 local function pickNext(kind, sw, fromId)
     local c = Cfg[kind]
     local pool = poolFor(kind, sw)
-    if #pool == 0 then return nil, pool end
+    if #pool == 0 then
+        if not emptyPoolLogged[kind] then
+            emptyPoolLogged[kind] = true
+            log("[%s] pool is empty: mod will not switch until something is ticked", kind)
+        end
+        return nil, pool
+    end
+    emptyPoolLogged[kind] = nil
     if c.mode == "random" then
         if #pool == 1 then return pool[1], pool end
         local cands = {}
@@ -509,8 +528,10 @@ local function step(kind)
         local again = pickNext(kind, sw, nextId)
         if again then nextId = again end
     end
-    cursors[kind] = nextId
     applyTarget(sub, kind, nextId, sw)
+    -- 没换成功就别推进游标，否则下一把会被跳过
+    local landed = curOf(sub, kind)
+    cursors[kind] = (landed ~= nil and landed == nextId) and nextId or landed
     refreshUi()
 end
 
@@ -589,12 +610,26 @@ local function restoreOriginal()
         for _, kind in ipairs(KINDS) do
             local s = snap[kind]
             if s and #s.list > 0 then
-                for i = 1, #s.list do
+                -- 现场槽位可能比快照少（玩家在背包里卸过）：只写存在的格，
+                -- 否则 ReplaceWeaponByIndex 会拿到越界下标
+                local _, _, live = equippedSlots(sub, kind)
+                for i = 1, math.min(#s.list, live) do
                     T[kind].replace(sub, s.list[i], i - 1)
                 end
                 muteHook(0.25)
-                T[kind].setCur(sub, s.idx)
+                if live > 0 then
+                    T[kind].setCur(sub, math.min(s.idx, live - 1))
+                end
                 log("restored %s: idx=%d [%s]", kind, s.idx, table.concat(s.list, ","))
+            end
+        end
+        -- 槽位比快照多：多出来那格是模组换上去的，清空它会崩原生链，只能提示手动卸
+        for _, kind in ipairs(KINDS) do
+            local s = snap[kind]
+            local _, _, live = equippedSlots(sub, kind)
+            if s and #s.list > 0 and live > #s.list then
+                log("restore[%s]: %d slots now but snapshot had %d, please unequip the extra one in the bag",
+                    kind, live, #s.list)
             end
         end
     end)
@@ -729,25 +764,6 @@ end
 
 local function onSetWeaponByIndex(ctx, idxParam, isNormalParam)
     if os.clock() < hookMuteUntil then return nil end
-    if armedKind and os.clock() < armedUntil then
-        armedKind = nil
-        log("armed: let native switch through, will drop the swapped-out one")
-        local dropKind = Cfg.target
-        ExecuteInGameThreadWithDelay(3000, function()
-            local svc = getSub()
-            if not svc then return end
-            local _, idxNow = curOf(svc, dropKind)
-            local _, order = equippedSlots(svc, dropKind)
-            local other = 1 - (idxNow or 0)
-            local drop = order and order[other + 1]
-            if not drop or isBlankId(drop) then
-                log("single-slot[%s]: other slot already empty", dropKind)
-                return
-            end
-            log("single-slot[%s]: would drop %s — deletion disabled (9.5.0)", dropKind, tostring(drop))
-        end)
-        return nil
-    end
     local ok, err = pcall(function()
         if busy then return end
         if inMapTransition() then return end
@@ -896,35 +912,6 @@ local function findWeaponConfig(id)
     return nil
 end
 
--- 关键怀疑：SetSlotWeapon 对“背包里没有的武器”会返回 ok 但实际不生效。
--- 先把玩家真正拥有的武器列出来看看。
-local ownedLogged = false
-local function ownedWeapons()
-    local sub = getSub()
-    if not sub then return nil end
-    local out = {}
-    local function push(v)
-        local id = S(v)
-        if id and id ~= "" and id ~= "None" then out[#out + 1] = id end
-    end
-    local okA, arr = pcall(function() return sub:GetAllNormalWeapons() end)
-    local n = 0
-    if okA and type(arr) == "table" then
-        for _, v in ipairs(arr) do push(v); n = n + 1 end
-    end
-    local okE, eq = pcall(function() return sub:GetEquipmentNormalWeapons() end)
-    local m = 0
-    if okE and type(eq) == "table" then
-        for _, v in ipairs(eq) do push(v); m = m + 1 end
-    end
-    if not ownedLogged then
-        ownedLogged = true
-        log("owned: GetAllNormalWeapons ok=%s n=%d | GetEquipmentNormalWeapons ok=%s n=%d", tostring(okA), n, tostring(okE), m)
-        log("owned ids: [%s]", table.concat(out, ","))
-    end
-    return out
-end
-
 -- ── F9 菜单（复用 PBZTrainingDummy 同款 ModMenu 外壳）──────────────
 local ui = nil
 do
@@ -937,45 +924,6 @@ local function closeAnyUi()
     if ui then pcall(function() ui.Close() end) end
 end
 pcall(function() RegisterKeyBind(Key.ESCAPE, closeAnyUi) end)
--- F3：安全枚举 UFunction 名字（只读元数据，不碰属性、不调游戏函数）
--- RemoveWeapon 在背包子系统上是 MulticastDelegate 事件，不能调用；改用 ForEachFunction 看真实函数名
-local function dumpFuncs(obj, label, pattern)
-    if not obj then log("dump[%s]: nil", label); return end
-    local cls = nil
-    pcall(function() cls = obj:GetClass() end)
-    if not cls then log("dump[%s]: no class", label); return end
-    local n = 0
-    local ok, err = pcall(function()
-        -- 回调参数是 UFunction 对象本身（不是字符串），名字要 GetFullName() 再取冒号后半段
-        cls:ForEachFunction(function(fn)
-            local okn, full = pcall(function() return fn:GetFullName() end)
-            if not okn then return end
-            local name = tostring(full):match("([%w_]+)$") or tostring(full)
-            if pattern == nil or name:lower():find(pattern) then
-                n = n + 1
-                if n <= 400 then log("dump[%s]: %s", label, name) end
-            end
-        end)
-    end)
-    log("dump[%s]: matched=%d ok=%s err=%s", label, n, tostring(ok), ok and "-" or tostring(err))
-end
-
--- 参数类型探测：故意传错类型，让 UE4SS 在“封送参数”阶段就报错（不会执行函数体，不会崩）
-local function probeTypes()
-    local comp = nil
-    pcall(function() comp = FindFirstOf("CharacterWeaponsComponent") end)
-    if not comp then log("ptype: no comp"); return end
-    local tag = { TagName = "Weapon.Slot.Main" }
-    local function try(label, f)
-        local ok, err = pcall(f)
-        log("ptype[%s]: ok=%s -> %s", label, tostring(ok), tostring(err))
-    end
-    try("Get(tag,str,str)", function() return comp:GetSlotWeapon(tag, "q", "q") end)
-    try("Get(str,str,str)", function() return comp:GetSlotWeapon("q", "q", "q") end)
-    try("Set(str,str,str)", function() return comp:SetSlotWeapon("q", "q", "q") end)
-    try("Set(tag,str,str)", function() return comp:SetSlotWeapon(tag, "q", "q") end)
-    log("ptype: done")
-end
 local function labelOf(kind)
     if kind == "shaqi" then return L("影之武装", "Shaqi weapon") end
     return L("主武器", "Main weapon")
@@ -1017,6 +965,7 @@ local function langOptions()
 end
 
 local menuBuilt = false
+local menuStaleLogged = false
 local funcRefreshWeapons = nil
 local registerSections = nil
 local requestRebuild = function() end   -- 由下方赋值：重建控件必须推迟到回调之外
@@ -1032,6 +981,72 @@ local function poolAllSelected(kind, items)
     return true
 end
 
+-- 4.5.2：全选按钮绝不再逐个 ui.Set 去写 25 个 checkbox——连点时 SetIsChecked 会在
+-- 点击事件还在派发的过程中改控件状态（并触发 InputMode.SetActive），实测直接崩。
+-- 只改配置，然后延迟重建一次；重建后每个 checkbox 的默认值本来就从 Cfg 读。
+-- 4.5.6：连点节流已去掉——目标状态是按当前配置算出来的（幂等），
+-- 节流只会让玩家的点击被吞掉，表现为“连点没反应”。
+-- 4.5.9：不再用“同步窗口”挡 onChange。已经改成按状态判断——回调给出的
+-- 目标值和配置里已有的值相同，说明是程序性 SetIsChecked 引发的回声，直接忽略；
+-- 不同则一定是玩家真点了。这样窗口期内的真实点击也不会被吞掉。
+
+-- 池子变了：循环游标要重新按“手上这把”定位，预置的那把也要作废，
+-- 并推迟到回调之外刷新一次界面——否则勾选/全选都要再点「刷新武器列表」才生效。
+-- ModMenu 把每个控件的值缓存在 S.values 里，一旦有值就不再读 item.default；
+-- 所以重建之前必须把 values 也按当前配置刷一遍，否则重建出来还是旧勾选。
+local function syncPoolValues(kind)
+    if not ui then return end
+    local sub = getSub()
+    if not sub then return end
+    local sw = sortedWeapons(sub, kind)
+    if not sw then return end
+    local c = Cfg[kind]
+    for _, it in ipairs(sw.items) do
+        local on = (c.pool == nil) and true or (c.pool[it.id] == true)
+        pcall(function() ui.Set('pool', kind .. '_' .. it.id, on) end)
+    end
+end
+
+-- 4.5.10：池子的版本号。每次配置变动 +1，延迟同步只在“版本没再变过”时才落地，
+-- 否则重新排一次——不然连点时后一次点击会被前一次排下的全量同步盖回旧状态，
+-- 表现为“点了没反应”（同步写值与点击在同一帧里交错）。
+local poolRev = { main = 0, shaqi = 0 }
+local poolRefreshQueued = { main = false, shaqi = false }
+local poolSyncSchedule        -- 前向声明（下面的闭包要递归调用自己）
+
+poolSyncSchedule = function(kind, rev)
+    if poolRefreshQueued[kind] then return end
+    poolRefreshQueued[kind] = true
+    ExecuteInGameThreadWithDelay(180, function()
+        poolRefreshQueued[kind] = false
+        if not funcRefreshWeapons then return end
+        if rev ~= poolRev[kind] then
+            -- 这段等待期间玩家又改过池子：这轮早已过期，按新版本重新排
+            poolSyncSchedule(kind, poolRev[kind])
+            return
+        end
+        pcall(syncPoolValues, kind)
+        -- 只同步控件值与状态行，不重建整棵树：重建会让列表闪一下（4.5.6 的反馈）
+        local open = false
+        if ui then
+            local ok, v = pcall(function() return ui.IsOpen() end)
+            open = ok and v or false
+        end
+        if open then
+            pcall(setStatusLabels)
+        else
+            menuStale = true          -- 菜单没开：下次打开时重建，免得显示旧勾选
+        end
+    end)
+end
+
+local function poolChanged(kind)
+    pending[kind], pendingAt[kind] = nil, 0
+    cursors[kind] = nil
+    poolRev[kind] = (poolRev[kind] or 0) + 1
+    poolSyncSchedule(kind, poolRev[kind])
+end
+
 local function poolItemsFor(sub, kind)
     local sw = sortedWeapons(sub, kind)
     local items = {}
@@ -1042,14 +1057,20 @@ local function poolItemsFor(sub, kind)
         label = L("全选 / 取消全选", "Select all / none"),
         onClick = function()
             local cc = Cfg[kind]
-            local on = not poolAllSelected(kind, sw.items)   -- 目标状态：要么全选，要么全不选
-            cc.pool = on and nil or {}
-            for _, it in ipairs(sw.items) do
-                pcall(function() ui.Set('pool', kind .. '_' .. it.id, on) end)
+            -- 目标状态永远与现状相反：allNow=true 就全不选，false 就全选。
+            -- （4.5.7 曾在这里拿 (pool == nil) 和 allNow 比较，空池时两者都是 false，
+            --  于是“取消全选”后再点被当成 already，永远回不到全选。）
+            local on = not poolAllSelected(kind, sw.items)
+            -- 注意不能写 `on and nil or {}`：on 为 true 时 `true and nil` 是 nil（假值），
+            -- 会被 or 吃掉，结果永远赋成空表——第二次按就再也回不到全选。
+            if on then
+                cc.pool = nil
+            else
+                cc.pool = {}
             end
+            poolChanged(kind)          -- 已预置的那把是按旧池子挑的，立刻作废
             saveCfg()
-            log("[%s] pool all = %s", kind, tostring(on))
-            refreshUi()
+            log("[%s] pool all = %s (config now, widgets synced after the click)", kind, tostring(on))
         end }
 
     for _, it in ipairs(sw.items) do
@@ -1061,11 +1082,17 @@ local function poolItemsFor(sub, kind)
             default = checked,
             onChange = function(on)
                 local cc = Cfg[kind]
+                local was = (cc.pool == nil) and true or (cc.pool[it.id] == true)
+                if was == (on == true) then
+                    -- 程序性 SetIsChecked 引起的回声：值本来就一样，什么都不用做
+                    return
+                end
                 if cc.pool == nil then
                     cc.pool = {}
                     for _, x in ipairs(sw.items) do cc.pool[x.id] = true end
                 end
                 cc.pool[it.id] = on and true or nil
+                poolChanged(kind)      -- 池子变了，预置的那把不再属于池子
                 saveCfg()
                 refreshUi()
             end,
@@ -1261,11 +1288,16 @@ local function refreshWeapons(force)
             local sw = sortedWeapons(sub, kind)
             local c = Cfg[kind]
             if sw and c.pool then
+                local removed = false
                 for id in pairs(c.pool) do
-                    if not indexOf(sw.ids, id) then c.pool[id] = nil end
+                    if not indexOf(sw.ids, id) then
+                        c.pool[id] = nil
+                        removed = true
+                    end
                 end
-                if not next(c.pool) then c.pool = nil end
-                saveCfg()
+                -- 空池是玩家明确的“一个都不勾”，不能当成没配置改回全选
+                -- （4.5.4 起空池落盘为 `pool=-`，loadCfg 会读回空表）
+                if removed then saveCfg() end
             end
         end
     end
@@ -1308,6 +1340,7 @@ local function buildMenu(sub)
             if not sub2 then return end
             if menuStale then
                 menuStale = false
+                menuStaleLogged = false
                 pcall(refreshWeapons, true)
                 return
             end
@@ -1467,9 +1500,9 @@ local function tick()
             ensureSnapshot()
             pcall(slotWatch)
             if not menuBuilt then buildMenu(sub) end
-            if menuStale then
-                menuStale = false
-                log("map load done: menu data will refresh on next open")
+            if menuStale and not menuStaleLogged then
+                menuStaleLogged = true
+                log("menu data stale: rebuild on next open")
             end
         end
     end)
@@ -1595,6 +1628,11 @@ local function stageNextWeapon(kind)
     -- 仍在另一格时——空手就立刻把那一格设为当前（玩家卸了武器，不能干等按键），
     -- 有武器在手就继续等玩家按切换键（只刷新时间戳，绝不清标记，否则死循环）。
     local p = pending[kind]
+    if p and not inPool(kind, p) then
+        log("stage[%s] pending %s dropped (no longer in pool)", kind, tostring(p))
+        pending[kind], pendingAt[kind] = nil, 0
+        p = nil
+    end
     if p then
         local age = os.clock() - (pendingAt[kind] or 0)
         if p == curId then
@@ -1651,6 +1689,15 @@ local function stageNextWeapon(kind)
         other = (curIdx == 0) and 1 or 0
         if other >= cnt then other = 0 end
     end
+    -- 只有一格时，“预置下一把”等于把手上的武器在数据层静默替换掉（没有切换动画，
+    -- 玩家手里会突然变成另一把）。这种情况宁可不预置，等玩家按键走 applyTarget。
+    if cnt < 2 and curId ~= nil then
+        if not singleSlotWarned[kind] then
+            singleSlotWarned[kind] = true
+            log("stage[%s]: only %d slot, skip staging (would overwrite the held weapon)", kind, cnt)
+        end
+        return
+    end
     busy = true
     local ok, err = pcall(T[kind].replace, sub, nxt, other)
     busy = false
@@ -1704,134 +1751,6 @@ resetWeaponState = function()
     pending.shaqi = nil
     idleTicks = 0
     invWidget = nil
-end
-
--- 找到某把武器对应的「切换武器技能」GA 实例（GA_Hun_<Weapon>_SWT_C），并通过技能系统激活
-local gaDumped = {}
-local ascDumped = false
-
-local function dumpClassFns(obj, label)
-    local names = {}
-    pcall(function()
-        local cls = obj:GetClass()
-        cls:ForEachFunction(function(fn)
-            local okf, f2 = pcall(function() return fn:GetFullName() end)
-            if okf and f2 then
-                local n = tostring(f2):match("([%w_]+)$")
-                if n then names[#names + 1] = n end
-            end
-        end)
-    end)
-    table.sort(names)
-    log("%s functions(%d): %s", label, #names, table.concat(names, ","))
-    return names
-end
-
-local function findAsc()
-    local out = nil
-    for _, cls in ipairs({ "PBZAbilitySystemComponent", "AbilitySystemComponent" }) do
-        local ok, list = pcall(FindAllOf, cls)
-        if ok and type(list) == "table" and #list > 0 then
-            out = { cls = cls, list = list }
-            break
-        end
-    end
-    return out
-end
-
-fireSwitchAbility = function(kind, id)
-    if type(id) ~= "string" or id == "" then return end
-    local found = nil
-    for _, cls in ipairs({ "GA_Hun_" .. id .. "_SWT_C", "GA_" .. id .. "_SWT_C" }) do
-        local okF, list = pcall(FindAllOf, cls)
-        if okF and type(list) == "table" and #list > 0 then
-            found = { cls = cls, ga = list[1], count = #list }
-            break
-        end
-    end
-    if not found then
-        -- id 不一定等于资源名（如 RenOuQingTongJian 的配置是 Weapon_Hun_TianXuanQingTongJian），
-        -- 改从当前手持武器对象上取名再拼 GA 类名
-        local okC, comp = pcall(FindFirstOf, "CharacterWeaponsComponent")
-        local names = {}
-        if okC and comp then
-            for _, g in ipairs({ "GetCurrentWeaponActorWeapon", "GetWeaponActorWeapon", "GetCurrentWeapon" }) do
-                local okG, obj = pcall(function() return comp[g](comp) end)
-                if okG and obj then
-                    local okN, full = pcall(function() return obj:GetFullName() end)
-                    if okN and full then
-                        names[#names + 1] = tostring(full)
-                        local w = tostring(full):match("Weapon_Hun_([%w_]+)")
-                        if w then names[#names + 1] = "GA_Hun_" .. w .. "_SWT_C" end
-                    end
-                end
-            end
-        end
-        log("ga[%s] no GA for id %s; hints: %s", kind, tostring(id), table.concat(names, " | "))
-        for _, cls in ipairs(names) do
-            if cls:sub(1, 3) == "GA_" then
-                local okF, list = pcall(FindAllOf, cls)
-                if okF and type(list) == "table" and #list > 0 then
-                    found = { cls = cls, ga = list[1], count = #list }
-                    log("ga[%s] resolved via hint -> %s", kind, cls)
-                    break
-                end
-            end
-        end
-        if not found then return end
-    end
-    log("ga[%s] %s -> %d instance(s)", kind, found.cls, found.count)
-    if not gaDumped[found.cls] then
-        gaDumped[found.cls] = true
-        dumpClassFns(found.ga, "ga[class]")
-    end
-
-    local asc = findAsc()
-    if not asc then log("ga[%s] no ability system component found", kind); return end
-    log("ga[%s] asc = %s (%d)", kind, asc.cls, #asc.list)
-    if not ascDumped then
-        ascDumped = true
-        dumpClassFns(asc.list[1], "asc[class]")
-    end
-
-    local gaCls = nil
-    pcall(function() gaCls = found.ga:GetClass() end)
-    if not gaCls then log("ga[%s] no class on instance", kind); return end
-    for i, comp in ipairs(asc.list) do
-        local okA, res = pcall(function() return comp:TryActivateAbilityByClass(gaCls, true) end)
-        log("ga[%s] asc#%d TryActivateAbilityByClass -> ok=%s res=%s", kind, i,
-            tostring(okA), tostring(res))
-        if okA then break end
-    end
-end
-
--- 侦察：武器相关对象上都有哪些函数（找“切换武器释放技能”的入口）
-dumpWeaponApis = function()
-    local okC, comp = pcall(FindFirstOf, "CharacterWeaponsComponent")
-    if not okC or not comp then log("dump: no component"); return end
-    local getters = { "GetCurrentWeapon", "GetCurrentWeaponActorWeapon", "GetWeaponActorWeapon",
-                      "GetAbilityWeapon", "GetChangeWeaponAbilityWeapon", "GetChangeArmedAbilityWeapon" }
-    for _, g in ipairs(getters) do
-        local okG, obj = pcall(function() return comp[g](comp) end)
-        if okG and obj then
-            local names = {}
-            pcall(function()
-                obj:ForEachFunction(function(fn)
-                    local okN, full = pcall(function() return fn:GetFullName() end)
-                    if okN and full then
-                        local name = tostring(full):match("([%w_]+)$")
-                        if name then names[#names + 1] = name end
-                    end
-                end)
-            end)
-            table.sort(names)
-            local okCls, clsName = pcall(function() return obj:GetClass():GetFullName() end)
-            log("dump %s -> %s (%d fn): %s", g, tostring(okCls and clsName or "?"), #names,
-                table.concat(names, ","))
-        else
-            log("dump %s -> failed (%s)", g, tostring(obj))
-        end
-    end
 end
 
 -- 一次性转储：把 CharacterWeaponsComponent 的函数名全打到日志里（找切换技能入口用）
