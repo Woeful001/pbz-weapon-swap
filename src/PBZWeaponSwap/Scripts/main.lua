@@ -1,10 +1,16 @@
--- PBZWeaponSwap v4.5.0
+-- PBZWeaponSwap v4.5.1
 -- 用游戏原生的换武器键驱动两套武器：
 --   主武器   键盘 1 / 手柄十字键左   -> SetCurrentWeaponByIndex(idx, true)
 --   影之武装 键盘 2 / 手柄十字键右   -> SetCurrentWeaponByIndex(idx, false)
 -- 每套各自有 关闭 / 循环 / 随机 / 自定义池 四种模式，F9 打开菜单，首行选择要配置哪一套。
 -- 4.5.0：重做菜单面板排版与状态行；武器列表按拼音排序、支持自定义池；
 --        新增“武器切换冷却”开关（cd=1 保留游戏原生冷却，cd=0 由模组切换后立即清冷却）。
+-- 4.5.1：修两处菜单问题——
+--        1) 全选/取消全选的状态判断错了：空池（一个都没勾）被当成“已全选”，于是取消后
+--           再也选不回来，按钮只能一直取消；
+--        2) 菜单重建从按钮/下拉框回调里移出、合并成延迟单次重建，解决点“刷新武器列表”
+--           或连续操作时 UE4SS 直接崩溃（重建会销毁正在派发事件的控件）。
+
 
 local SRC = debug.getinfo(1, 'S').source:gsub('^@', '')
 local DIR = SRC:match('^(.*[/\\])') or ''
@@ -13,7 +19,7 @@ local LOG_PATH = ROOT .. 'log.txt'
 local CFG_PATH = ROOT .. 'config.txt'
 local SNAP_PATH = ROOT .. 'snapshot.txt'
 local DEBUG = true
-local VERSION = "4.5.0"
+local VERSION = "4.5.1"
 
 local function log(fmt, ...)
     local ok, s = pcall(string.format, fmt, ...)
@@ -1013,6 +1019,18 @@ end
 local menuBuilt = false
 local funcRefreshWeapons = nil
 local registerSections = nil
+local requestRebuild = function() end   -- 由下方赋值：重建控件必须推迟到回调之外
+
+-- 4.5.1：「一个都没勾」(pool = {}) 曾被当成「已全选」，所以取消全选后按钮再也选不回来
+local function poolAllSelected(kind, items)
+    local c = Cfg[kind]
+    if c.pool == nil then return true end
+    if next(c.pool) == nil then return false end
+    for _, it in ipairs(items) do
+        if not c.pool[it.id] then return false end
+    end
+    return true
+end
 
 local function poolItemsFor(sub, kind)
     local sw = sortedWeapons(sub, kind)
@@ -1024,14 +1042,10 @@ local function poolItemsFor(sub, kind)
         label = L("全选 / 取消全选", "Select all / none"),
         onClick = function()
             local cc = Cfg[kind]
-            local allOn = (cc.pool == nil) or (next(cc.pool) == nil)
-            local on = not allOn
-            if on then
-                cc.pool = nil
-                for _, it in ipairs(sw.items) do pcall(function() ui.Set('pool', kind .. '_' .. it.id, true) end) end
-            else
-                cc.pool = {}
-                for _, it in ipairs(sw.items) do pcall(function() ui.Set('pool', kind .. '_' .. it.id, false) end) end
+            local on = not poolAllSelected(kind, sw.items)   -- 目标状态：要么全选，要么全不选
+            cc.pool = on and nil or {}
+            for _, it in ipairs(sw.items) do
+                pcall(function() ui.Set('pool', kind .. '_' .. it.id, on) end)
             end
             saveCfg()
             log("[%s] pool all = %s", kind, tostring(on))
@@ -1086,10 +1100,7 @@ local function swapItems()
                   local cc = Cfg[v]
                   pcall(function() ui.Set('swap', 'mode', cc.mode) end)
                   pcall(function() ui.Set('swap', 'cd', not Cfg.cd) end)
-                  pcall(function()
-                      ui.Register({ id = 'pool', title = L('自定义池 · ', 'Custom pool · ') .. labelOf(v),
-                          items = poolItemsFor(getSub(), v) })
-                  end)
+                  requestRebuild(80)   -- 池 section 的标题/内容跟着目标变，延迟重建
               end
               log("menu target = %s", v)
               refreshUi()
@@ -1138,11 +1149,21 @@ local function swapItems()
     }
 end
 
-registerSections = function(sub)
-    if not ui then return end
-    ui.Register({ id = 'swap', title = L('武器切换', 'Weapon Swap'), items = swapItems(), collapsible = false })
-    ui.Register({ id = 'pool', title = L('自定义池 · ', 'Custom pool · ') .. labelOf(Cfg.target),
-        items = poolItemsFor(sub, Cfg.target) })
+registerSections = function(sub, immediate)
+    -- 默认只排队，不在调用者的回调里同步重建（见 requestRebuild 的注释）；
+    -- 首次建菜单（tick 里，非 UI 回调）传 immediate=true 立刻注册。
+    if immediate and ui then
+        pcall(function()
+            ui.Register({ id = 'swap', title = L('武器切换', 'Weapon Swap'),
+                items = swapItems(), collapsible = false })
+        end)
+        pcall(function()
+            ui.Register({ id = 'pool', title = L('自定义池 · ', 'Custom pool · ') .. labelOf(Cfg.target),
+                items = poolItemsFor(sub, Cfg.target) })
+        end)
+        return
+    end
+    requestRebuild(60)
 end
 
 local function setStatusLabels()
@@ -1169,6 +1190,44 @@ local function setStatusLabels()
         pcall(function() ui.SetLabel('swap', 'poolInfo', L('池：', 'Pool: ') .. txt) end)
     end
 end
+
+-- 4.5.1：重建菜单控件绝不能在按钮/下拉框回调里同步发生——ModMenu.Register 会立刻
+-- 调 ExecuteInGameThread 重建整棵树，正在派发事件的那个控件被销毁，UE4SS 直接崩。
+-- 这里统一推迟到回调之外，且同一时刻只排一次队；两个 section 之间再隔 120ms，
+-- 避免同一帧里连做两次整树重建。
+local rebuildQueued = false
+requestRebuild = function(delay)
+    if rebuildQueued then return end
+    rebuildQueued = true
+    ExecuteInGameThreadWithDelay(delay or 400, function()
+        rebuildQueued = false
+        if not ui then return end
+        local okOpen, isOpen = pcall(function() return ui.IsOpen() end)
+        if not (okOpen and isOpen) then
+            menuStale = true                      -- 菜单没开：等下次打开再重建
+            log('rebuild: menu closed, deferred to next open')
+            return
+        end
+        local sub = getSub()
+        if not sub then return end
+        local ok1, err1 = pcall(function()
+            ui.Register({ id = 'swap', title = L('武器切换', 'Weapon Swap'),
+                items = swapItems(), collapsible = false })
+        end)
+        log('rebuild: swap section ok=%s err=%s', tostring(ok1), tostring(err1))
+        ExecuteInGameThreadWithDelay(120, function()
+            local ok2, err2 = pcall(function()
+                local s2 = getSub()
+                if not s2 then return end
+                ui.Register({ id = 'pool', title = L('自定义池 · ', 'Custom pool · ') .. labelOf(Cfg.target),
+                    items = poolItemsFor(s2, Cfg.target) })
+            end)
+            log('rebuild: pool section ok=%s err=%s', tostring(ok2), tostring(err2))
+            pcall(setStatusLabels)
+        end)
+    end)
+end
+
 
 -- 4.x 下 GetAllNormalWeapons() 的返回形态不稳定（且 GetMainWeaponTableData 会崩），
 -- 这里直接用内置名单计数，不再碰引擎侧列表接口
@@ -1212,9 +1271,8 @@ local function refreshWeapons(force)
     end
     resolveLang()
     -- 面包屑：重建菜单控件是最容易硬崩的一步，崩了就只会停在这两行之间
-    log('refresh: rebuild menu sections ...')
-    if ui then pcall(registerSections, sub) end
-    log('refresh: sections done, labels ...')
+    log('refresh: request deferred rebuild ...')
+    requestRebuild(80)
     setStatusLabels()
     local m = sortedWeapons(sub, 'main')
     local s = sortedWeapons(sub, 'shaqi')
@@ -1241,7 +1299,7 @@ local function buildMenu(sub)
         bottomFrac = 0.12,
     })
 
-    registerSections(sub)
+    registerSections(sub, true)
     setStatusLabels()
 
     local function refresh()
