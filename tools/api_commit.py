@@ -62,7 +62,18 @@ def main():
     base_sha = base["object"]["sha"]
     base_commit = call("GET", "/repos/%s/%s/git/commits/%s" % (OWNER, REPO, base_sha))
 
-    changed = git("diff", "--name-only", base_sha, head).splitlines()
+    # 服务端提交在本地没有对象，只能拿“上次推送时的本地 HEAD”来算差异
+    state_path = os.path.join(git("rev-parse", "--absolute-git-dir"), "api_commit_state.json")
+    prev_local = None
+    if os.path.exists(state_path):
+        with open(state_path, encoding="utf-8") as f:
+            st = json.load(f)
+        if st.get("remote") == base_sha:
+            prev_local = st.get("local")
+    diff_base = prev_local if prev_local and subprocess.call(
+        ["git", "cat-file", "-e", prev_local + "^{commit}"], stderr=subprocess.DEVNULL) == 0 else base_sha
+
+    changed = git("diff", "--name-only", diff_base, head).splitlines()
     if not changed:
         sys.exit("nothing to commit")
     print("changed:", ", ".join(changed))
@@ -91,6 +102,8 @@ def main():
                    "author": author, "committer": author})
     call("PATCH", "/repos/%s/%s/git/refs/heads/main" % (OWNER, REPO),
          {"sha": commit["sha"], "force": False})
+    with open(state_path, "w", encoding="utf-8") as f:
+        json.dump({"local": head, "remote": commit["sha"]}, f)
     print("pushed %s -> %s" % (base_sha[:10], commit["sha"]))
     print("https://github.com/%s/%s/commit/%s" % (OWNER, REPO, commit["sha"]))
 
