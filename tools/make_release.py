@@ -18,11 +18,10 @@ REPO = "pbz-weapon-swap"
 API = "https://api.github.com"
 
 NOTES = {
-    "4.5.1": (
-        "**4.5.1**\n\n"
-        "- 修复「全选 / 取消全选」：池子被清空（一个都没勾）时曾把自己当成“已全选”，取消之后再点只会继续取消；现在会正确判断并把整池勾回来\n"
-        "- 修复点「刷新武器列表」或连续点菜单时 UE4SS 崩溃：菜单重建原本在按钮回调里同步执行，会销毁正在派发点击的那个控件；现在统一推迟到回调之外，一次操作只重建一次，菜单关着时留到下次打开\n\n"
-        "下载 `PBZWeaponSwap-4.5.1.zip`，解压到游戏的 `platform/steam/ue4ss/Mods/` 目录。"
+    "4.5.5": (
+        "**4.5.5**\n\n"
+        "- 修复已知的崩溃 bug，优化部分逻辑\n\n"
+        "下载 `PBZWeaponSwap-4.5.5.zip`，解压到游戏的 `platform/steam/ue4ss/Mods/` 目录。"
     ),
     "4.5.0": (
         "**4.5.0**\n\n"
@@ -41,7 +40,19 @@ def token():
     for p in (os.path.join(os.environ.get("TEMP", ""), "ghtok.txt"), os.path.expanduser("~/.ghtok")):
         if p and os.path.exists(p):
             with open(p, "r", encoding="utf-8") as f:
-                return f.read().strip()
+                v = f.read().strip()
+            if v:
+                return v
+    # 兜底：直接从 Windows 凭据管理器取 git 用的那种 classic PAT
+    import subprocess
+    out = subprocess.run(
+        ["git", "-c", "credential.helper=manager", "credential", "fill"],
+        input="protocol=https\nhost=github.com\nusername=Woeful001\n\n",
+        capture_output=True, text=True, check=True,
+    ).stdout
+    for line in out.splitlines():
+        if line.startswith("password="):
+            return line.split("=", 1)[1].strip()
     sys.exit("no GH_TOKEN")
 
 
