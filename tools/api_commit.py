@@ -30,7 +30,16 @@ def token():
     if os.path.exists(p):
         with open(p, encoding="utf-8") as f:
             return f.read().strip()
-    sys.exit("no GH_TOKEN / %TEMP%\\ghtok.txt")
+    # 兜底：直接从 Windows 凭据管理器取 git 用的那种 PAT（与 make_release.py 一致）
+    out = subprocess.run(
+        ["git", "-c", "credential.helper=manager", "credential", "fill"],
+        input="protocol=https\nhost=github.com\nusername=Woeful001\n\n",
+        capture_output=True, text=True, check=True,
+    ).stdout
+    for line in out.splitlines():
+        if line.startswith("password="):
+            return line.split("=", 1)[1].strip()
+    sys.exit("no GH_TOKEN / %TEMP%\\ghtok.txt / credential manager")
 
 
 TOK = token()

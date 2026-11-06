@@ -18,6 +18,11 @@ REPO = "pbz-weapon-swap"
 API = "https://api.github.com"
 
 NOTES = {
+    "4.5.12": (
+        "**4.5.12**\n\n"
+        "- 优化了部分代码\n\n"
+        "下载 `PBZWeaponSwap-4.5.12.zip`，解压到游戏的 `platform/steam/ue4ss/Mods/` 目录。"
+    ),
     "4.5.5": (
         "**4.5.5**\n\n"
         "- 修复已知的崩溃 bug，优化部分逻辑\n\n"

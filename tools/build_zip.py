@@ -19,7 +19,7 @@ MOD = os.path.join(LOCAL, "src", "PBZWeaponSwap")
 CONFIG_TMPL = """version={ver}
 lang=auto
 target=main
-cd=0
+cd=1
 main.mode=cycle
 shaqi.mode=cycle
 """

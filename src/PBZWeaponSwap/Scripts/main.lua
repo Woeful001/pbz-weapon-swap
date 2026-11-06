@@ -1,4 +1,4 @@
--- PBZWeaponSwap v4.5.5
+-- PBZWeaponSwap v4.5.12
 -- 用游戏原生的换武器键驱动两套武器：
 --   主武器   键盘 1 / 手柄十字键左   -> SetCurrentWeaponByIndex(idx, true)
 --   影之武装 键盘 2 / 手柄十字键右   -> SetCurrentWeaponByIndex(idx, false)
@@ -10,6 +10,12 @@
 --           再也选不回来，按钮只能一直取消；
 --        2) 菜单重建从按钮/下拉框回调里移出、合并成延迟单次重建，解决点“刷新武器列表”
 --           或连续操作时 UE4SS 直接崩溃（重建会销毁正在派发事件的控件）。
+-- 4.5.12：稳定性与开销优化（玩法不变）——
+--        1) 切图后作废背挂网格组件缓存，不再对已销毁对象调 RefreshWeaponVisibility；
+--        2) 预置逻辑复用已读到的槽位数组，每轮少一半反射调用；
+--        3) 关掉逐帧槽位观察、ModMenu 追踪与函数转储（DEBUG_* 开关可开回），日志加 2 MB 轮转；
+--        4) 移除从未调用的 findWeaponConfig（内部含 LoadAsset）与永远为假的列表变更检测；
+--        5) F2 恢复整段屏蔽钩子，写槽不再可能被自己拦下。
 
 
 local SRC = debug.getinfo(1, 'S').source:gsub('^@', '')
@@ -19,7 +25,23 @@ local LOG_PATH = ROOT .. 'log.txt'
 local CFG_PATH = ROOT .. 'config.txt'
 local SNAP_PATH = ROOT .. 'snapshot.txt'
 local DEBUG = true
-local VERSION = "4.5.5"
+local DEBUG_WATCH = false   -- 逐 tick 打印槽位变化（只在排查槽位问题时开）
+local DEBUG_TRACE = false   -- 追踪 ModMenu 关闭流程的每一步（只在排查关闭崩溃时开）
+local DUMP_FUNCS = false    -- 启动 4 秒后把 CharacterWeaponsComponent 的函数名打进日志
+local VERSION = "4.5.12"
+
+-- 日志轮转：>2 MB 就把旧日志转成 log.prev.txt（只留一份），避免长期游玩后无限增长
+do
+    local f = io.open(LOG_PATH, "rb")
+    if f then
+        local size = f:seek("end")
+        f:close()
+        if size and size > 2 * 1024 * 1024 then
+            os.remove(ROOT .. "log.prev.txt")
+            os.rename(LOG_PATH, ROOT .. "log.prev.txt")
+        end
+    end
+end
 
 -- random 模式用 math.random，不播种的话每次启动都是同一串顺序
 pcall(math.randomseed, os.time())
@@ -67,11 +89,21 @@ local PY = {
     ["拳"] = "quan", ["套"] = "tao", ["黄"] = "huang", ["铳"] = "chong", ["柄"] = "bing",
 }
 
+local pyMissing = {}
 local function pinyin(name)
     local out = {}
     for _, cp in utf8.codes(name) do
         local ch = utf8.char(cp)
-        out[#out + 1] = PY[ch] or ch
+        local py = PY[ch]
+        if py == nil then
+            py = ch
+            -- 缺字的排序键会混进汉字（排在所有拼音之后），打到日志里方便补表
+            if not pyMissing[ch] then
+                pyMissing[ch] = true
+                log("pinyin: no entry for %s, kept as-is", ch)
+            end
+        end
+        out[#out + 1] = py
     end
     return table.concat(out, "")
 end
@@ -316,10 +348,10 @@ local function equippedSlots(sub, kind)
     return slots, order, n
 end
 
--- 以装备栏数组为准取当前武器：CurrentMainWeaponID 在切换后常有延迟，不能用于判断
-local function curOf(sub, kind)
+-- 以装备栏数组为准取当前武器：CurrentMainWeaponID 在切换后常有延迟，不能用于判断。
+-- 已经读过槽位数组的调用方（预置 tick）走 curOfWith，省掉一次 equippedSlots 反射。
+local function curOfWith(sub, kind, order, cnt)
     local def = T[kind]
-    local _, order, cnt = equippedSlots(sub, kind)
     local okI, idx = pcall(def.curIdx, sub)
     -- pcall 失败时第二个返回值是错误字符串，不能让字符串冒充下标传给调用方
     if not (okI and type(idx) == "number") then idx = nil end
@@ -328,6 +360,11 @@ local function curOf(sub, kind)
     end
     local okD, id = pcall(def.curId, sub)
     return okD and S(id) or nil, idx
+end
+
+local function curOf(sub, kind)
+    local _, order, cnt = equippedSlots(sub, kind)
+    return curOfWith(sub, kind, order, cnt)
 end
 
 -- 武器 ID → 游戏内中文显示名（内置，避免在 4.x 上调用 GetMainWeaponTableData 触发崩溃）
@@ -490,7 +527,7 @@ local emptyPoolLogged = {}
 local singleSlotWarned = {}
 -- 已经预置到待切槽、但玩家还没按键的武器：避免随机模式下每个 tick 都换一把塞进去
 local pending = { main = nil, shaqi = nil }
-local pendingAt = { main = 0, shaqi = 0 }   -- 4.8.9：装填标记的写入时间，超时自动作废
+local pendingAt = { main = 0, shaqi = 0 }   -- 装填标记的写入时间（仅日志/诊断，不做超时作废）
 
 local function pickNext(kind, sw, fromId)
     local c = Cfg[kind]
@@ -607,6 +644,7 @@ local function restoreOriginal()
     if not snap then log("no snapshot"); return end
     busy = true
     local ok, err = pcall(function()
+        muteHook(1.0) -- 整段恢复期间屏蔽钩子：写槽本身不该被当成玩家按键
         for _, kind in ipairs(KINDS) do
             local s = snap[kind]
             if s and #s.list > 0 then
@@ -694,6 +732,15 @@ local backComps = nil
 local backProbeLogged = false
 local backSyncOff = false
 
+-- 切图后这些组件随 World 一起销毁：对已销毁对象解析方法会硬崩，
+-- 所以每次用之前先问引擎 IsValid，缓存里混进死对象就整批重收。
+local function compAlive(c)
+    if c == nil then return false end
+    local okG, gv = pcall(function() return IsValid(c) end)
+    if okG and type(gv) == "boolean" then return gv end
+    return true
+end
+
 local function collectWeaponComps()
     local out = {}
     local pawn = nil
@@ -725,7 +772,17 @@ end
 local function backSyncWeapon(tag)
     tag = tostring(tag)
     if backSyncOff then return end
-    if backComps == nil then
+    local stale = false
+    if backComps then
+        for _, c in ipairs(backComps) do
+            if not compAlive(c) then stale = true; break end
+        end
+    end
+    if backComps == nil or stale then
+        if stale then
+            log("backprobe[%s]: cached components died (map change?), re-collecting", tag)
+        end
+        backComps, backProbeLogged, backSyncOff = nil, false, false
         local ok, res = pcall(collectWeaponComps)
         backComps = ok and res or {}
         log("backprobe[%s]: weapon components found=%d", tag, #backComps)
@@ -737,11 +794,13 @@ local function backSyncWeapon(tag)
     end
     local okN, errN = 0, nil
     for _, c in ipairs(backComps) do
-        local okR, errR = pcall(function() c:RefreshWeaponVisibility() end)
-        if okR then
-            okN = okN + 1
-        else
-            errN = errR
+        if compAlive(c) then
+            local okR, errR = pcall(function() c:RefreshWeaponVisibility() end)
+            if okR then
+                okN = okN + 1
+            else
+                errN = errR
+            end
         end
     end
     if not backProbeLogged then
@@ -750,12 +809,14 @@ local function backSyncWeapon(tag)
         if okN == 0 then
             -- 组件上没有这个函数，改在组件所属的武器 actor 上试
             for _, c in ipairs(backComps) do
-                local own = nil
-                pcall(function() own = c:GetOwner() end)
-                if own then
-                    local okA, errA = pcall(function() own:RefreshWeaponVisibility() end)
-                    log("back-sync[%s]: owner-refresh %s -> ok=%s err=%s", tag, tostring(own), tostring(okA), tostring(errA))
-                    if okA then break end
+                if compAlive(c) then
+                    local own = nil
+                    pcall(function() own = c:GetOwner() end)
+                    if own then
+                        local okA, errA = pcall(function() own:RefreshWeaponVisibility() end)
+                        log("back-sync[%s]: owner-refresh %s -> ok=%s err=%s", tag, tostring(own), tostring(okA), tostring(errA))
+                        if okA then break end
+                    end
                 end
             end
         end
@@ -867,50 +928,8 @@ local function slotIsEmpty(kind, sub, slot)
     return isBlankId(now), now
 end
 
-local cfgDiagDone = false
-local function findWeaponConfig(id)
-    local tried = { "PBZ_MainWeaponConfig_C", "PBZ_MainWeaponConfig", "PBZ_WeaponConfig_C" }
-    for _, cls in ipairs(tried) do
-        local ok, list = pcall(function() return FindAllOf(cls) end)
-        local n = (ok and list) and #list or -1
-        if not cfgDiagDone then
-            local samples = {}
-            if n > 0 then
-                for i = 1, math.min(n, 3) do
-                    local okf, full = pcall(function() return list[i]:GetFullName() end)
-                    samples[#samples + 1] = okf and full or "?"
-                end
-            end
-            log("cfg diag: %s -> %s [%s]", cls, tostring(n), table.concat(samples, " | "))
-        end
-        if n > 0 then
-            for _, o in ipairs(list) do
-                local okn, full = pcall(function() return o:GetFullName() end)
-                if okn and full and full:find(id, 1, true) then
-                    cfgDiagDone = true
-                    return o
-                end
-            end
-        end
-    end
-    cfgDiagDone = true
-    -- 内存里没有 = 这把武器没被加载过，按资源路径拉一次
-    local base = "/PBZCombatAsset/ActorData/Players/Hun/Weapon/"
-    local cands = {
-        base .. id .. "/Weapon_Hun_" .. id .. "." .. "Weapon_Hun_" .. id,
-        base .. id .. "/" .. id .. "." .. id,
-        base .. id .. "/Weapon_" .. id .. ".Weapon_" .. id,
-    }
-    for _, path in ipairs(cands) do
-        local okL, obj = pcall(function() return LoadAsset(path) end)
-        if okL and obj then
-            log("cfg loaded: %s", path)
-            return obj
-        end
-        log("cfg load failed: %s (%s)", path, tostring(obj))
-    end
-    return nil
-end
+-- 4.x 里 getWeaponConfig 不是必需的：武器只按名字/id 写槽，
+-- 当年留着的 findWeaponConfig（内部 LoadAsset）从没被调用过，已移除。
 
 -- ── F9 菜单（复用 PBZTrainingDummy 同款 ModMenu 外壳）──────────────
 local ui = nil
@@ -1143,7 +1162,7 @@ local function swapItems()
               refreshUi()
           end },
         { type = 'separator' },
-        { type = 'button', id = 'refresh', label = L("刷新武器列表（加入新获得的武器）", "Refresh weapon list (pick up newly acquired)"), onClick = function()
+        { type = 'button', id = 'refresh', label = L("刷新武器列表（重建列表与状态）", "Refresh weapon list (rebuild list and status)"), onClick = function()
             if funcRefreshWeapons then pcall(funcRefreshWeapons, true) end
         end },
         { type = 'button', id = 'restore', label = L("恢复原始装备（F2）", "Restore original loadout (F2)"), onClick = function()
@@ -1257,29 +1276,11 @@ end
 
 
 -- 4.x 下 GetAllNormalWeapons() 的返回形态不稳定（且 GetMainWeaponTableData 会崩），
--- 这里直接用内置名单计数，不再碰引擎侧列表接口
-local function weaponCount(sub, kind)
-    local names = NAMES[kind]
-    if not names then return 0 end
-    local n = 0
-    for _ in pairs(names) do n = n + 1 end
-    return n
-end
-
--- 池里可能新增（新获得武器）或消失（换档/读档），据此判断要不要重建列表
-local function listChanged(sub)
-    for _, kind in ipairs(KINDS) do
-        local n = weaponCount(sub, kind)
-        local c = cache[kind]
-        if n > 0 and (not c or #c.ids ~= n) then return true end
-    end
-    return false
-end
-
+-- 武器名单因此固定在内置 NAMES 里；下面只负责按当前配置重建缓存与控件。
 local function refreshWeapons(force)
     local sub = getSub()
     if not sub then return end
-    if force or listChanged(sub) then
+    if force then
         cache.main = nil
         cache.shaqi = nil
         pending.main = nil
@@ -1344,7 +1345,6 @@ local function buildMenu(sub)
                 pcall(refreshWeapons, true)
                 return
             end
-            if listChanged(sub2) then pcall(refreshWeapons, false) end
             setStatusLabels()
         end)
         if not ok then log("ERR refresh: %s", tostring(err)) end
@@ -1405,11 +1405,13 @@ local function buildMenu(sub)
             return r
         end
     end
-    traceFn("PBZWSMenu.shell.confirm", "Hide", "Confirm.Hide")
-    traceFn("PBZWSMenu.core.input", "ClearClickState", "Input.ClearClickState")
-    traceFn("PBZWSMenu.widgets.dropdown", "collapseAll", "Dropdown.collapseAll")
-    traceFn("PBZWSMenu.core.cursor", "Hide", "Cursor.Hide")
-    traceFn("PBZWSMenu.core.inputmode", "SetActive", "InputMode.SetActive")
+    if DEBUG_TRACE then
+        traceFn("PBZWSMenu.shell.confirm", "Hide", "Confirm.Hide")
+        traceFn("PBZWSMenu.core.input", "ClearClickState", "Input.ClearClickState")
+        traceFn("PBZWSMenu.widgets.dropdown", "collapseAll", "Dropdown.collapseAll")
+        traceFn("PBZWSMenu.core.cursor", "Hide", "Cursor.Hide")
+        traceFn("PBZWSMenu.core.inputmode", "SetActive", "InputMode.SetActive")
+    end
 
     menuBuilt = true
     local swShaqi = sortedWeapons(sub, "shaqi")
@@ -1480,6 +1482,7 @@ local function slotSignature(kind)
 end
 
 local function slotWatch()
+    if not DEBUG_WATCH then return end
     for _, kind in ipairs({ "main", "shaqi" }) do
         local sig = slotSignature(kind)
         if sig then
@@ -1498,7 +1501,7 @@ local function tick()
         local sub = getSub()
         if sub then
             ensureSnapshot()
-            pcall(slotWatch)
+            if DEBUG_WATCH then pcall(slotWatch) end
             if not menuBuilt then buildMenu(sub) end
             if menuStale and not menuStaleLogged then
                 menuStaleLogged = true
@@ -1619,7 +1622,7 @@ local function stageNextWeapon(kind)
     if not sw or #sw.ids == 0 then return end
     local slots, order, cnt = equippedSlots(sub, kind)
     if cnt < 1 then return end
-    local curId, curIdx = curOf(sub, kind)
+    local curId, curIdx = curOfWith(sub, kind, order, cnt)
     -- 手里是空槽（玩家在背包里卸下了武器）：没有“当前武器”这个概念，
     -- 从池子的第一把开始装填，而不是沿用那个空 id。
     if curId ~= nil and isBlankId(tostring(curId)) then curId = nil end
@@ -1634,7 +1637,6 @@ local function stageNextWeapon(kind)
         p = nil
     end
     if p then
-        local age = os.clock() - (pendingAt[kind] or 0)
         if p == curId then
             pending[kind] = nil
         elseif slots[p] == nil then
@@ -1749,29 +1751,42 @@ resetWeaponState = function()
     cursors.shaqi = nil
     pending.main = nil
     pending.shaqi = nil
+    pendingAt.main = 0
+    pendingAt.shaqi = 0
     idleTicks = 0
     invWidget = nil
+    -- 下面这些缓存指向旧 World 的对象：背挂组件会随世界销毁，
+    -- 留着它们等于下次切换时对野指针反射（崩溃点就在 RefreshWeaponVisibility）
+    backComps = nil
+    backProbeLogged = false
+    backSyncOff = false
+    watchPrev = {}
+    cdResetLogged = false
+    emptyPoolLogged = {}
+    singleSlotWarned = {}
 end
 
 -- 一次性转储：把 CharacterWeaponsComponent 的函数名全打到日志里（找切换技能入口用）
-ExecuteInGameThreadWithDelay(4000, function()
-    pcall(function()
-        local cls = StaticFindObject("/Script/SGameCombatSystem.CharacterWeaponsComponent")
-        if not cls then log("dump: class not found"); return end
-        local names = {}
+if DUMP_FUNCS then
+    ExecuteInGameThreadWithDelay(4000, function()
         pcall(function()
-            cls:ForEachFunction(function(fn)
-                local okN, full = pcall(function() return fn:GetFullName() end)
-                if okN and full then
-                    local name = tostring(full):match("([%w_]+)$")
-                    if name then names[#names + 1] = name end
-                end
+            local cls = StaticFindObject("/Script/SGameCombatSystem.CharacterWeaponsComponent")
+            if not cls then log("dump: class not found"); return end
+            local names = {}
+            pcall(function()
+                cls:ForEachFunction(function(fn)
+                    local okN, full = pcall(function() return fn:GetFullName() end)
+                    if okN and full then
+                        local name = tostring(full):match("([%w_]+)$")
+                        if name then names[#names + 1] = name end
+                    end
+                end)
             end)
+            table.sort(names)
+            log("dump functions (%d): %s", #names, table.concat(names, ","))
         end)
-        table.sort(names)
-        log("dump functions (%d): %s", #names, table.concat(names, ","))
     end)
-end)
+end
 
 loadCfg()
 log("loaded v" .. VERSION .. ": lang=%s (resolved when menu builds) main=%s shaqi=%s target=%s; F9 menu, F2 restore",
